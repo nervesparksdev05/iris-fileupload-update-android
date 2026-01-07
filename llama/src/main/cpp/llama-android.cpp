@@ -4,6 +4,8 @@
 #include <math.h>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
+#include <mutex>
 #include "llama.h"
 #include "common.h"
 #define JSON_ASSERT GGML_ASSERT
@@ -53,6 +55,11 @@ jmethodID la_int_var_value;
 jmethodID la_int_var_inc;
 
 std::string cached_token_chars;
+
+// Track heap allocations for llama_batch so free_batch() can reliably free all buffers.
+static std::mutex g_batch_mu;
+static std::unordered_map<llama_batch *, int> g_batch_n_tokens;
+static std::unordered_map<llama_batch *, int> g_batch_n_seq_max;
 
 bool is_valid_utf8(const char * string) {
     if (!string) {
@@ -222,6 +229,43 @@ Java_android_llama_cpp_LLamaAndroid_new_1context(JNIEnv *env, jobject, jlong jmo
 }
 
 extern "C"
+JNIEXPORT jlong JNICALL
+Java_android_llama_cpp_LLamaAndroid_new_1embedding_1context(JNIEnv *env, jobject, jlong jmodel, jint userThreads, jint nCtx, jint poolingType) {
+    auto model = reinterpret_cast<llama_model *>(jmodel);
+
+    if (!model) {
+        LOGe("new_embedding_context(): model cannot be null");
+        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), "Model cannot be null");
+        return 0;
+    }
+
+    int n_threads_batch = std::max(1, std::min(8, (int) sysconf(_SC_NPROCESSORS_ONLN) - 2));
+    int userSpecifiedThreads = (userThreads > 0)
+                               ? std::min(9, std::max(1, (int) userThreads))
+                               : std::max(1, std::min(8, (int) sysconf(_SC_NPROCESSORS_ONLN) - 2));
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx           = (int) nCtx;
+    ctx_params.n_threads       = userSpecifiedThreads;
+    ctx_params.n_threads_batch = n_threads_batch;
+
+    // Enable embeddings + pooling in llama.cpp
+    ctx_params.embeddings      = true;
+    ctx_params.pooling_type    = (enum llama_pooling_type) poolingType;
+
+    llama_context * context = llama_new_context_with_model(model, ctx_params);
+
+    if (!context) {
+        LOGe("new_embedding_context(): llama_new_context_with_model() returned null");
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                      "llama_new_context_with_model() returned null");
+        return 0;
+    }
+
+    return reinterpret_cast<jlong>(context);
+}
+
+extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_free_1context(JNIEnv *, jobject, jlong context) {
     llama_free(reinterpret_cast<llama_context *>(context));
@@ -251,7 +295,7 @@ Java_android_llama_cpp_LLamaAndroid_bench_1model(
         jint tg,
         jint pl,
         jint nr
-        ) {
+) {
     auto pp_avg = 0.0;
     auto tg_avg = 0.0;
     auto pp_std = 0.0;
@@ -360,13 +404,13 @@ Java_android_llama_cpp_LLamaAndroid_new_1batch(JNIEnv *, jobject, jint n_tokens,
     // Source: Copy of llama.cpp:llama_batch_init but heap-allocated.
 
     llama_batch *batch = new llama_batch {
-        0,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr,
+            0,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
     };
 
     if (embd) {
@@ -382,6 +426,12 @@ Java_android_llama_cpp_LLamaAndroid_new_1batch(JNIEnv *, jobject, jint n_tokens,
         batch->seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
     }
     batch->logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens);
+
+    {
+        std::lock_guard<std::mutex> lk(g_batch_mu);
+        g_batch_n_tokens[batch] = (int) n_tokens;
+        g_batch_n_seq_max[batch] = (int) n_seq_max;
+    }
 
     return reinterpret_cast<jlong>(batch);
 }
@@ -405,12 +455,38 @@ void fixed_llama_batch_free(struct llama_batch batch) {
 extern "C"
 JNIEXPORT void JNICALL
 Java_android_llama_cpp_LLamaAndroid_free_1batch(JNIEnv *, jobject, jlong batch_pointer) {
+    auto batch = reinterpret_cast<llama_batch *>(batch_pointer);
+    if (!batch) return;
 
+    int n_tokens = 0;
+    int n_seq_max = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_batch_mu);
+        auto itN = g_batch_n_tokens.find(batch);
+        auto itS = g_batch_n_seq_max.find(batch);
+        if (itN != g_batch_n_tokens.end()) n_tokens = itN->second;
+        if (itS != g_batch_n_seq_max.end()) n_seq_max = itS->second;
+        g_batch_n_tokens.erase(batch);
+        g_batch_n_seq_max.erase(batch);
+    }
 
-    common_batch_clear(*reinterpret_cast<llama_batch *>(batch_pointer));
+    common_batch_clear(*batch);
 
-//    fixed_llama_batch_free(*reinterpret_cast<llama_batch *>(batch_pointer));
+    if (batch->token) free(batch->token);
+    if (batch->embd) free(batch->embd);
+    if (batch->pos) free(batch->pos);
 
+    if (batch->seq_id) {
+        // seq_id is allocated as [n_tokens][n_seq_max]
+        for (int i = 0; i < n_tokens; ++i) {
+            free(batch->seq_id[i]);
+        }
+        free(batch->seq_id);
+    }
+    if (batch->n_seq_id) free(batch->n_seq_id);
+    if (batch->logits) free(batch->logits);
+
+    delete batch;
 }
 
 extern "C"
@@ -478,7 +554,7 @@ Java_android_llama_cpp_LLamaAndroid_completion_1init(
         jlong batch_pointer,
         jstring jtext,
         jint n_len
-    ) {
+) {
 
     cached_token_chars.clear();
 
@@ -585,6 +661,61 @@ Java_android_llama_cpp_LLamaAndroid_kv_1cache_1clear(JNIEnv *, jobject, jlong co
     llama_kv_cache_clear(reinterpret_cast<llama_context *>(context));
 }
 
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_android_llama_cpp_LLamaAndroid_embedding_1for_1text(JNIEnv * env, jobject, jlong context_pointer, jlong batch_pointer, jstring jtext) {
+    auto context = reinterpret_cast<llama_context *>(context_pointer);
+    auto batch   = reinterpret_cast<llama_batch *>(batch_pointer);
+
+    if (!context || !batch) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "embedding_for_text(): context/batch is null");
+        return env->NewFloatArray(0);
+    }
+
+    const auto text = env->GetStringUTFChars(jtext, 0);
+    const auto tokens_list_full = common_tokenize(context, text, 1);
+    env->ReleaseStringUTFChars(jtext, text);
+
+    llama_kv_cache_clear(context);
+    common_batch_clear(*batch);
+
+    // Cap tokens to context window
+    const int n_ctx = llama_n_ctx(context);
+    std::vector<llama_token> tokens_list = tokens_list_full;
+    if ((int) tokens_list.size() > n_ctx) {
+        tokens_list.resize(n_ctx);
+    }
+
+    // Evaluate
+    for (int i = 0; i < (int) tokens_list.size(); ++i) {
+        common_batch_add(*batch, tokens_list[i], i, { 0 }, false);
+    }
+    if (batch->n_tokens > 0) {
+        batch->logits[batch->n_tokens - 1] = true;
+    }
+
+    if (llama_decode(context, *batch) != 0) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "llama_decode() failed in embedding_for_text()");
+        return env->NewFloatArray(0);
+    }
+
+    const llama_model * model = llama_get_model(context);
+
+    const float * emb = llama_get_embeddings_seq(context, 0);
+    if (!emb) {
+        emb = llama_get_embeddings(context);
+    }
+    if (!emb) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Could not read embeddings from llama context");
+        return env->NewFloatArray(0);
+    }
+
+    const int n_embd = llama_n_embd(model);
+    jfloatArray out = env->NewFloatArray(n_embd);
+    env->SetFloatArrayRegion(out, 0, n_embd, emb);
+    return out;
+}
+
 // Format given chat. If tmpl is empty, we take the template from model metadata
 inline std::string format_chat(const llama_model *model, const std::string &tmpl, const std::vector<json> &messages) {
     std::vector<common_chat_msg> chat;
@@ -660,6 +791,6 @@ Java_android_llama_cpp_LLamaAndroid_get_1eot_1str(JNIEnv *env, jobject , jlong j
         piece.resize(n_chars);
     }
 
-     return env->NewStringUTF(piece.c_str());
+    return env->NewStringUTF(piece.c_str());
 
 }

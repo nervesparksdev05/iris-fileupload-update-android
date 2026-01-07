@@ -16,11 +16,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import com.nervesparks.iris.Downloadable
 import com.nervesparks.iris.MainViewModel
-
-
+import com.nervesparks.iris.isPartialDownload
 
 @Composable
 fun DownloadModal(viewModel: MainViewModel, dm: DownloadManager, models: List<Downloadable>) {
+    // ✅ show only models that are missing or partial/0 bytes
+    val pending = models.filter {
+        !it.destination.exists() || it.destination.length() == 0L || isPartialDownload(it.destination)
+    }
+
     Dialog(onDismissRequest = {}) {
         Surface(
             shape = RoundedCornerShape(8.dp),
@@ -37,14 +41,24 @@ fun DownloadModal(viewModel: MainViewModel, dm: DownloadManager, models: List<Do
                 HeaderText("Download Required")
                 HeaderText("Don't close or minimize the app!")
                 HeaderModelText("Download at least 1 model")
+
                 LazyColumn(
                     modifier = Modifier
                         .padding(16.dp)
                         .fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    items(models.filter { !it.destination.exists() }) { model ->
-                        DownloadCard(viewModel, dm, model)
+                    if (pending.isEmpty()) {
+                        item {
+                            Text(
+                                text = "All models are already downloaded.",
+                                color = Color.White
+                            )
+                        }
+                    } else {
+                        items(pending) { model ->
+                            DownloadCard(viewModel, dm, model)
+                        }
                     }
                 }
             }
@@ -59,8 +73,7 @@ private fun HeaderModelText(text: String) {
         fontWeight = FontWeight.W900,
         fontSize = 18.sp,
         color = Color.White,
-        modifier = Modifier
-            .padding(top = 14.dp)
+        modifier = Modifier.padding(top = 14.dp)
     )
 }
 
@@ -91,10 +104,7 @@ private fun DownloadCard(viewModel: MainViewModel, dm: DownloadManager, model: D
                 .padding(8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = model.name,
-                color = Color(0xFFbbbdbf)
-            )
+            Text(text = model.name, color = Color(0xFFbbbdbf))
             Spacer(modifier = Modifier.height(8.dp))
             Downloadable.Button(viewModel, dm, model)
         }

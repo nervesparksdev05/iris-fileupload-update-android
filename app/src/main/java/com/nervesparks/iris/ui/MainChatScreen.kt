@@ -51,6 +51,8 @@ import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Slider
 import androidx.compose.material.SliderDefaults
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.Button
@@ -66,7 +68,6 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.SheetState
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -104,38 +105,43 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.toSize
-import androidx.compose.ui.window.Dialog
 import com.nervesparks.iris.Downloadable
 import com.nervesparks.iris.LinearGradient
 import com.nervesparks.iris.MainViewModel
-
 import com.nervesparks.iris.R
-import com.nervesparks.iris.ui.components.ChatMessageList
+import com.nervesparks.iris.docs.DocumentTextExtractor
 import com.nervesparks.iris.ui.components.DownloadModal
 import com.nervesparks.iris.ui.components.LoadingModal
-
+import com.nervesparks.iris.ui.components.UploadedDocsRow
 import kotlinx.coroutines.launch
 import java.io.File
 
+// ✅ NEW: chip model (what shows at bottom like your screenshot)
+private data class PendingAttachment(
+    val uri: Uri,
+    val name: String,
+    val mime: String,
+)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun MainChatScreen (
+fun MainChatScreen(
     onNextButtonClicked: () -> Unit,
     viewModel: MainViewModel,
     clipboard: ClipboardManager,
     dm: DownloadManager,
     models: List<Downloadable>,
     extFileDir: File?,
-
-){
+) {
     val kc = LocalSoftwareKeyboardController.current
     val windowInsets = WindowInsets.ime
     val focusManager = LocalFocusManager.current
     println("Thread started: ${Thread.currentThread().name}")
+
     val Prompts = listOf(
         "Explain how to develop a consistent reading habit.",
         "Write an email to your manager requesting leave for a day.",
@@ -156,222 +162,223 @@ fun MainChatScreen (
         "May sometimes be inaccurate.",
         "Unable to provide current affairs due to no internet connectivity."
     )
+
     var recognizedText by remember { mutableStateOf("") }
-    val speechRecognizerLauncher = rememberLauncherForActivityResult(contract = ActivityResultContracts.StartActivityForResult()) {
-            result ->
-        val data = result.data
-        val results = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
-        recognizedText = results?.get(0)?:""
-        viewModel.updateMessage(recognizedText)
+    val speechRecognizerLauncher =
+        rememberLauncherForActivityResult(contract = ActivityResultContracts.StartActivityForResult()) { result ->
+            val data = result.data
+            val results = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            recognizedText = results?.get(0) ?: ""
+            viewModel.updateMessage(recognizedText)
+        }
 
+    val context = LocalContext.current
+
+    // ✅ Use indexed docs (Room-backed) instead of old userDocs list
+    val docs = viewModel.indexedDocs.value
+    val docCount = docs.size
+    val maxDocs = 10
+
+    // ✅ NEW: what we show as bottom “file chips” (like your screenshot)
+    var pendingAttachments by remember { mutableStateOf<List<PendingAttachment>>(emptyList()) }
+
+    // 📎 Upload documents
+    val docPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNullOrEmpty()) return@rememberLauncherForActivityResult
+
+        val remaining: Int = (maxDocs - docCount).coerceAtLeast(0)
+        val toAdd: List<Uri> = if (uris.size > remaining) uris.take(remaining) else uris
+
+        if (toAdd.isNotEmpty()) {
+            // ✅ Start indexing (your existing behavior)
+            viewModel.addUserDocs(context, toAdd)
+            Toast.makeText(context, "Added ${toAdd.size} document(s)", Toast.LENGTH_SHORT).show()
+
+            // ✅ NEW: update bottom chip(s)
+            val metas = toAdd.map { uri ->
+                val meta = DocumentTextExtractor.queryMeta(context.contentResolver, uri)
+                PendingAttachment(
+                    uri = uri,
+                    name = meta.displayName,
+                    mime = meta.mime
+                )
+            }
+            pendingAttachments = (pendingAttachments + metas).distinctBy { it.uri.toString() }
+        }
+
+        if (uris.size > remaining) {
+            Toast.makeText(context, "Upload cap is $maxDocs documents", Toast.LENGTH_SHORT).show()
+        }
     }
-
-
-
-
 
     val focusRequester = FocusRequester()
     var isFocused by remember { mutableStateOf(false) }
     var textFieldBounds by remember { mutableStateOf<androidx.compose.ui.geometry.Rect?>(null) }
+
     if (allModelsExist) {
         viewModel.showModal = false
     }
-    Box(
-        modifier = Modifier.fillMaxSize()
 
-
-    ) {
+    Box(modifier = Modifier.fillMaxSize()) {
         LinearGradient()
 
+        Column {
+            if (viewModel.showModal) {
+                DownloadModal(viewModel = viewModel, dm = dm, models = models)
+            }
 
+            if (viewModel.showAlert) {
+                LoadingModal(viewModel)
+            }
 
-            // Screen content
-            Column() {
+            Column {
+                val scrollState = rememberLazyListState()
 
-
-                // Show modal if required
-                if (viewModel.showModal) {
-                    // Modal dialog to show download options
-                    DownloadModal(viewModel = viewModel, dm = dm, models = models)
-
-                }
-
-                if (viewModel.showAlert) {
-                    // Modal dialog to show download options
-                    LoadingModal(viewModel)
-                }
-
-                Column {
-
-
-                    val scrollState = rememberLazyListState()
-
-
-                    Box(modifier = Modifier
+                Box(
+                    modifier = Modifier
                         .weight(1f)
                         .pointerInput(Unit) {
                             detectTapGestures(
-                                onTap = {
-                                    kc?.hide()
-                                },
+                                onTap = { kc?.hide() },
                                 onDoubleTap = { kc?.hide() },
                                 onLongPress = { kc?.hide() },
                                 onPress = { kc?.hide() },
-
-
+                            )
+                        }
+                ) {
+                    if (viewModel.messages.isEmpty() && !viewModel.showModal && !viewModel.showAlert) {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .wrapContentHeight(Alignment.CenterVertically),
+                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            item {
+                                Text(
+                                    text = "Hello, Ask me Anything",
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.W300,
+                                        letterSpacing = 1.sp,
+                                        fontSize = 50.sp,
+                                        lineHeight = 60.sp
+                                    ),
+                                    fontFamily = FontFamily.SansSerif,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(16.dp)
+                                        .wrapContentHeight()
                                 )
-                        }) {
+                            }
 
-                        if (viewModel.messages.isEmpty() && !viewModel.showModal && !viewModel.showAlert) {
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxSize() // Take up the whole screen
-                                    .wrapContentHeight(Alignment.CenterVertically),
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-//                                item { Spacer(Modifier.height(55.dp).fillMaxWidth()) }
-                                // Header Text
-                                item {
-                                    Text(
-                                        text = "Hello, Ask me " + "Anything",
-                                        style = MaterialTheme.typography.bodySmall.copy(
-                                            color = Color.White,
-                                            fontWeight = FontWeight.W300,
-                                            letterSpacing = 1.sp,
-                                            fontSize = 50.sp,
-                                            lineHeight = 60.sp
-                                        ),
-                                        fontFamily = FontFamily.SansSerif,
-                                        textAlign = TextAlign.Center,
+                            items(Prompts_Home.size) { index ->
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(60.dp)
+                                        .padding(8.dp)
+                                        .background(
+                                            Color(0xFF010825),
+                                            shape = RoundedCornerShape(20.dp)
+                                        )
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier
                                             .fillMaxWidth()
-                                            .padding(16.dp)
-                                            .wrapContentHeight()
-                                    )
-                                }
-
-                                // Items for Prompts_Home
-                                items(Prompts_Home.size) { index ->
-                                    Box(
-                                        contentAlignment = Alignment.Center,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(60.dp)
-                                            .padding(8.dp)
-                                            .background(
-                                                Color(0xFF010825),
-                                                shape = RoundedCornerShape(20.dp)
-                                            )
+                                            .padding(horizontal = 8.dp)
                                     ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
+                                        Box(
                                             modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(horizontal = 8.dp)
+                                                .size(20.dp)
+                                                .background(Color.White, shape = CircleShape)
+                                                .padding(4.dp),
+                                            contentAlignment = Alignment.Center
                                         ) {
-                                            // Circle Icon
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(20.dp) // Icon size
-                                                    .background(Color.White, shape = CircleShape)
-                                                    .padding(4.dp),
-                                                contentAlignment = Alignment.Center
-                                            ) {
-                                                Icon(
-                                                    painter = painterResource(id = R.drawable.info_svgrepo_com),
-                                                    contentDescription = null,
-                                                    tint = Color.Black
+                                            Icon(
+                                                painter = painterResource(id = R.drawable.info_svgrepo_com),
+                                                contentDescription = null,
+                                                tint = Color.Black
+                                            )
+                                        }
+
+                                        Spacer(modifier = Modifier.width(12.dp))
+
+                                        Text(
+                                            text = Prompts_Home.getOrNull(index) ?: "",
+                                            style = MaterialTheme.typography.bodySmall.copy(color = Color.White),
+                                            textAlign = TextAlign.Start,
+                                            fontSize = 12.sp,
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .padding(horizontal = 8.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            item { }
+                        }
+                    } else {
+                        LazyColumn(state = scrollState) {
+                            val length = viewModel.messages.size
+
+                            itemsIndexed(
+                                viewModel.messages.slice(3 until length) as? List<Map<String, String>>
+                                    ?: emptyList()
+                            ) { _, messageMap ->
+                                val role = messageMap["role"] ?: ""
+                                val content = messageMap["content"] ?: ""
+                                val trimmedMessage = if (content.endsWith("\n")) {
+                                    content.substring(0, content.length - 1)
+                                } else content
+
+                                if (role != "system") {
+                                    if (role != "codeBlock") {
+                                        Box {
+                                            val ctx = LocalContext.current
+                                            val interactionSource = remember { MutableInteractionSource() }
+                                            val sheetState = rememberModalBottomSheetState()
+                                            var isSheetOpen by rememberSaveable { mutableStateOf(false) }
+
+                                            if (isSheetOpen) {
+                                                MessageBottomSheet(
+                                                    message = trimmedMessage,
+                                                    clipboard = clipboard,
+                                                    context = ctx,
+                                                    viewModel = viewModel,
+                                                    onDismiss = {
+                                                        isSheetOpen = false
+                                                        viewModel.toggler = false
+                                                    },
+                                                    sheetState = sheetState
                                                 )
                                             }
 
-                                            Spacer(modifier = Modifier.width(12.dp))
-
-                                            // Text
-                                            Text(
-                                                text = Prompts_Home.getOrNull(index) ?: "",
-                                                style = MaterialTheme.typography.bodySmall.copy(color = Color.White),
-                                                textAlign = TextAlign.Start, // Left align the text
-                                                fontSize = 12.sp,
+                                            Row(
+                                                horizontalArrangement = if (role == "user") Arrangement.End else Arrangement.Start,
                                                 modifier = Modifier
-                                                    .weight(1f)
-                                                    .padding(horizontal = 8.dp)
-                                            )
-                                        }
-                                    }
-                                }
-
-                                item{
-
-                                }
-                            }
-                        }
-                        else {
-
-                            LazyColumn(state = scrollState) {
-                                // Track the first user and assistant messages
-
-                                var length = viewModel.messages.size
-
-                                itemsIndexed(viewModel.messages.slice(3..< length) as? List<Map<String, String>> ?: emptyList()) { index, messageMap ->
-                                    val role = messageMap["role"] ?: ""
-                                    val content = messageMap["content"] ?: ""
-                                    val trimmedMessage = if (content.endsWith("\n")) {
-                                        content.substring(startIndex = 0, endIndex = content.length - 1)
-                                    } else {
-                                        content
-                                    }
-
-                                    // Skip rendering first user and first assistant messages
-
-                                    if (role != "system") {
-                                        if (role != "codeBlock") {
-                                            Box {
-                                                val context = LocalContext.current
-                                                val interactionSource = remember { MutableInteractionSource() }
-                                                val sheetState = rememberModalBottomSheetState()
-                                                var isSheetOpen by rememberSaveable {
-                                                    mutableStateOf(false)
-                                                }
-                                                if(isSheetOpen){
-                                                    MessageBottomSheet(
-                                                        message = trimmedMessage,
-                                                        clipboard = clipboard,
-                                                        context = context,
-                                                        viewModel = viewModel,
-                                                        onDismiss = {
-                                                            isSheetOpen = false
-                                                            viewModel.toggler = false
-                                                        },
-                                                        sheetState = sheetState
+                                                    .fillMaxWidth()
+                                                    .padding(start = 8.dp, top = 8.dp, end = 8.dp, bottom = 0.dp),
+                                            ) {
+                                                if (role == "assistant") {
+                                                    Image(
+                                                        painter = painterResource(id = R.drawable.logo),
+                                                        contentDescription = "Bot Icon",
+                                                        modifier = Modifier.size(20.dp)
                                                     )
                                                 }
-                                                Row(
-                                                    horizontalArrangement = if (role == "user") Arrangement.End else Arrangement.Start,
+
+                                                Box(
                                                     modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .padding(
-                                                            start = 8.dp,
-                                                            top = 8.dp,
-                                                            end = 8.dp,
-                                                            bottom = 0.dp
-                                                        ),
-                                                ) {
-                                                    if(role == "assistant") {
-                                                        Image(
-                                                            painter = painterResource(
-                                                                id = R.drawable.logo
-                                                            ),
-                                                            contentDescription =  "Bot Icon",
-                                                            modifier = Modifier.size(20.dp)
-                                                        )
-                                                    }
-                                                    Box(modifier = Modifier
                                                         .padding(horizontal = 2.dp)
                                                         .background(
-                                                            color = if (role == "user") Color(
-                                                                0xFF171E2C
-                                                            ) else Color.Transparent,
+                                                            color = if (role == "user") Color(0xFF171E2C) else Color.Transparent,
                                                             shape = RoundedCornerShape(12.dp),
                                                         )
                                                         .combinedClickable(
@@ -379,204 +386,218 @@ fun MainChatScreen (
                                                             indication = ripple(color = Color.Gray),
                                                             onLongClick = {
                                                                 if (viewModel.getIsSending()) {
-                                                                    Toast
-                                                                        .makeText(
-                                                                            context,
-                                                                            " Wait till generation is done! ",
-                                                                            Toast.LENGTH_SHORT
-                                                                        )
-                                                                        .show()
+                                                                    Toast.makeText(
+                                                                        ctx,
+                                                                        " Wait till generation is done! ",
+                                                                        Toast.LENGTH_SHORT
+                                                                    ).show()
                                                                 } else {
                                                                     isSheetOpen = true
                                                                 }
                                                             },
-                                                            onClick = {
-                                                                kc?.hide()
-                                                            }
+                                                            onClick = { kc?.hide() }
                                                         )
-                                                    ) {
-                                                        Row(
+                                                ) {
+                                                    Row(modifier = Modifier.padding(5.dp)) {
+                                                        Box(
                                                             modifier = Modifier
-                                                                .padding(5.dp)
+                                                                .widthIn(max = 300.dp)
+                                                                .padding(3.dp)
                                                         ) {
-                                                            Box(
-                                                                modifier = Modifier
-                                                                    .widthIn(max = 300.dp)
-                                                                    .padding(3.dp)
-                                                            ){
-                                                                Text(
-                                                                    text = if (trimmedMessage.startsWith("```")) {
-                                                                        trimmedMessage.substring(3)
-                                                                    } else {
-                                                                        trimmedMessage
-                                                                    },
-                                                                    style = MaterialTheme.typography.bodyLarge.copy(color = Color(0xFFA0A0A5)),
-                                                                    modifier = Modifier
-                                                                        .padding(start = 1.dp, end = 1.dp)
-                                                                )
-                                                            }
+                                                            Text(
+                                                                text = if (trimmedMessage.startsWith("```")) {
+                                                                    trimmedMessage.substring(3)
+                                                                } else trimmedMessage,
+                                                                style = MaterialTheme.typography.bodyLarge.copy(color = Color(0xFFA0A0A5)),
+                                                                modifier = Modifier.padding(start = 1.dp, end = 1.dp)
+                                                            )
                                                         }
                                                     }
-                                                    if(role == "user") {
-                                                        Image(
-                                                            painter = painterResource(
-                                                                id = R.drawable.user_icon
-                                                            ),
-                                                            contentDescription = "Human Icon",
-                                                            modifier = Modifier.size(20.dp)
-                                                        )
-                                                    }
                                                 }
-                                            }
-                                        } else {
-                                            val context = LocalContext.current
-                                            val interactionSource = remember { MutableInteractionSource() }
-                                            val sheetState = rememberModalBottomSheetState()
-                                            var isSheetOpen by rememberSaveable {
-                                                mutableStateOf(false)
-                                            }
-                                            // Code block rendering remains the same
-                                            Box(
-                                                modifier = Modifier
-                                                    .padding(horizontal = 10.dp, vertical = 4.dp)
-                                                    .background(
-                                                        Color.Black,
-                                                        shape = RoundedCornerShape(8.dp)
-                                                    )
-                                                    .fillMaxWidth()
-                                            ) {
-                                                if(isSheetOpen){
-                                                    MessageBottomSheet(
-                                                        message = trimmedMessage,
-                                                        clipboard = clipboard,
-                                                        context = context,
-                                                        viewModel = viewModel,
-                                                        onDismiss = {
-                                                            isSheetOpen = false
-                                                            viewModel.toggler = false
-                                                        },
-                                                        sheetState = sheetState
+
+                                                if (role == "user") {
+                                                    Image(
+                                                        painter = painterResource(id = R.drawable.user_icon),
+                                                        contentDescription = "Human Icon",
+                                                        modifier = Modifier.size(20.dp)
                                                     )
                                                 }
-                                                Column(modifier = Modifier.combinedClickable(
-                                                        interactionSource = interactionSource,
-                                                indication = ripple(color = Color.LightGray),
-                                                onLongClick = {
-                                                    if (viewModel.getIsSending()) {
-                                                        Toast
-                                                            .makeText(
-                                                                context,
+                                            }
+                                        }
+                                    } else {
+                                        val ctx = LocalContext.current
+                                        val interactionSource = remember { MutableInteractionSource() }
+                                        val sheetState = rememberModalBottomSheetState()
+                                        var isSheetOpen by rememberSaveable { mutableStateOf(false) }
+
+                                        Box(
+                                            modifier = Modifier
+                                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                                                .background(Color.Black, shape = RoundedCornerShape(8.dp))
+                                                .fillMaxWidth()
+                                        ) {
+                                            if (isSheetOpen) {
+                                                MessageBottomSheet(
+                                                    message = trimmedMessage,
+                                                    clipboard = clipboard,
+                                                    context = ctx,
+                                                    viewModel = viewModel,
+                                                    onDismiss = {
+                                                        isSheetOpen = false
+                                                        viewModel.toggler = false
+                                                    },
+                                                    sheetState = sheetState
+                                                )
+                                            }
+
+                                            Column(
+                                                modifier = Modifier.combinedClickable(
+                                                    interactionSource = interactionSource,
+                                                    indication = ripple(color = Color.LightGray),
+                                                    onLongClick = {
+                                                        if (viewModel.getIsSending()) {
+                                                            Toast.makeText(
+                                                                ctx,
                                                                 " Wait till generation is done! ",
                                                                 Toast.LENGTH_SHORT
-                                                            )
-                                                            .show()
-                                                    } else {
-                                                        isSheetOpen = true
-                                                    }
-                                                },
-                                                onClick = {
-                                                    kc?.hide()
-                                                }
-                                                )) {
-                                                    Row(
-                                                        horizontalArrangement = Arrangement.End,
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .padding(
-                                                                top = 8.dp,
-                                                                bottom = 8.dp,
-                                                                start = 6.dp,
-                                                                end = 6.dp
-                                                            )
-                                                    ) {
-                                                        // Previous content here
-                                                    }
-                                                    Text(
-                                                        text = if (trimmedMessage.startsWith("```")) {
-                                                            trimmedMessage.substring(3)
+                                                            ).show()
                                                         } else {
-                                                            trimmedMessage
-                                                        },
-                                                        style = MaterialTheme.typography.bodyLarge.copy(
-                                                            color = Color(0xFFA0A0A5)
-                                                        ),
-                                                        modifier = Modifier.padding(16.dp)
-                                                    )
-                                                }
+                                                            isSheetOpen = true
+                                                        }
+                                                    },
+                                                    onClick = { kc?.hide() }
+                                                )
+                                            ) {
+                                                Text(
+                                                    text = if (trimmedMessage.startsWith("```")) {
+                                                        trimmedMessage.substring(3)
+                                                    } else trimmedMessage,
+                                                    style = MaterialTheme.typography.bodyLarge.copy(color = Color(0xFFA0A0A5)),
+                                                    modifier = Modifier.padding(16.dp)
+                                                )
                                             }
                                         }
                                     }
                                 }
-                                item {
-                                    Spacer(modifier = Modifier
-                                        .height(1.dp)
-                                        .fillMaxWidth())
-                                }
                             }
 
-                            ScrollToBottomButton(
-                                scrollState = scrollState,
-                                messages = viewModel.messages,
-                                viewModel = viewModel
-                            )
-
-                        }
-
-                        //chat section ends here
-                    }
-                    LazyRow(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp), // Reduced space between cards
-                        contentPadding = PaddingValues(vertical = 8.dp)
-                    ) {
-                        items(Prompts.size) { index ->
-                            if(viewModel.messages.size <= 1){
-                                Card(
+                            item {
+                                Spacer(
                                     modifier = Modifier
+                                        .height(1.dp)
+                                        .fillMaxWidth()
+                                )
+                            }
+                        }
+
+                        ScrollToBottomButton(
+                            scrollState = scrollState,
+                            messages = viewModel.messages,
+                            viewModel = viewModel
+                        )
+                    }
+                }
+
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    contentPadding = PaddingValues(vertical = 8.dp)
+                ) {
+                    items(Prompts.size) { index ->
+                        if (viewModel.messages.size <= 1) {
+                            Card(
+                                modifier = Modifier
+                                    .height(100.dp)
+                                    .clickable {
+                                        viewModel.updateMessage(Prompts[index])
+                                        focusRequester.requestFocus()
+                                    }
+                                    .padding(horizontal = 8.dp),
+                                shape = MaterialTheme.shapes.medium,
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF030815))
+                            ) {
+                                Text(
+                                    text = Prompts[index],
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color(0xFFA0A0A5),
+                                        fontSize = 12.sp,
+                                    ),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier
+                                        .width(200.dp)
                                         .height(100.dp)
-                                        .clickable {
-                                            viewModel.updateMessage(Prompts[index])
-                                            focusRequester.requestFocus()
-                                        }
-                                        .padding(horizontal = 8.dp),
-                                    shape = MaterialTheme.shapes.medium,
-                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF030815))
-                                ) {
-
-                                    Text(
-                                        text = Prompts[index],
-                                        style = MaterialTheme.typography.bodySmall.copy(
-                                            color = Color(0xFFA0A0A5),
-                                            fontSize = 12.sp,
-                                        ),
-                                        textAlign = TextAlign.Center,
-                                        modifier = Modifier
-                                            .width(200.dp)
-                                            .height(100.dp)
-                                            .padding(horizontal = 15.dp, vertical = 12.dp)
-//                                                .align(Alignment.Center)
-                                    )
-
-                                }
+                                        .padding(horizontal = 15.dp, vertical = 12.dp)
+                                )
                             }
                         }
                     }
-                    //Prompt input field
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFF050B16))
+                }
 
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF050B16))
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
 
-                    ) {
+                        // ✅ show uploaded docs from Room-backed list
+                        if (docs.isNotEmpty()) {
+                            UploadedDocsRow(
+                                docs = docs,
+                                onRemove = { id ->
+                                    viewModel.removeUserDoc(id)
+                                    Toast.makeText(context, "Removed document", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        }
+
+                        // ✅ NEW: bottom “file chip” row like your screenshot
+                        AttachmentChipRow(
+                            items = pendingAttachments,
+                            onRemove = { uri ->
+                                pendingAttachments = pendingAttachments.filterNot { it.uri == uri }
+                            }
+                        )
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(start = 5.dp, top = 8.dp, bottom = 12.dp, end = 5.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically,
-
+                        ) {
+                            // 📎 Upload icon
+                            IconButton(
+                                onClick = {
+                                    if (docCount >= maxDocs) {
+                                        Toast.makeText(
+                                            context,
+                                            "Upload cap is $maxDocs documents",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    } else {
+                                        docPickerLauncher.launch(
+                                            arrayOf(
+                                                "application/pdf",
+                                                "text/*",
+                                                "application/msword",
+                                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                                "application/vnd.ms-excel",
+                                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                                "application/json",
+                                                "application/*"
+                                            )
+                                        )
+                                    }
+                                    focusManager.clearFocus()
+                                }
                             ) {
-
+                                Icon(
+                                    imageVector = Icons.Filled.AttachFile,
+                                    contentDescription = "Attach documents",
+                                    tint = Color(0xFFDDDDE4),
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
 
                             IconButton(onClick = {
                                 val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -588,20 +609,14 @@ fun MainChatScreen (
                                 }
                                 speechRecognizerLauncher.launch(intent)
                                 focusManager.clearFocus()
-
                             }) {
                                 Icon(
-//                                imageVector = Icons.Default.Send,
-                                    modifier = Modifier
-                                        .size(25.dp)
-                                        .weight(1f),
+                                    modifier = Modifier.size(25.dp),
                                     painter = painterResource(id = R.drawable.microphone_new_svgrepo_com),
                                     contentDescription = "Mic",
-                                    tint = Color(0xFFDDDDE4) // Optional: set the color of the icon
+                                    tint = Color(0xFFDDDDE4)
                                 )
                             }
-
-
 
                             val dragSelection = remember { mutableStateOf<TextRange?>(null) }
                             val lastKnownText = remember { mutableStateOf(viewModel.message) }
@@ -610,40 +625,24 @@ fun MainChatScreen (
                                 mutableStateOf(
                                     TextFieldValue(
                                         text = viewModel.message,
-                                        selection = TextRange(viewModel.message.length) // Ensure cursor starts at the end
+                                        selection = TextRange(viewModel.message.length)
                                     )
                                 )
                             }
 
                             TextField(
-
                                 value = textFieldValue.value.copy(
                                     text = viewModel.message,
                                     selection = when {
-                                        viewModel.message != lastKnownText.value -> {
-                                            // If the message has changed programmatically,
-                                            // preserve the current cursor/selection position
-                                            textFieldValue.value.selection
-                                        }
-                                        else -> {
-                                            // Otherwise, use the drag selection or current selection
-                                            dragSelection.value ?: textFieldValue.value.selection
-                                        }
+                                        viewModel.message != lastKnownText.value -> textFieldValue.value.selection
+                                        else -> dragSelection.value ?: textFieldValue.value.selection
                                     }
                                 ),
                                 onValueChange = { newValue ->
-                                    // Update drag selection when the user drags or selects
-                                    dragSelection.value = if (newValue.text == textFieldValue.value.text) {
-                                        newValue.selection
-                                    } else {
-                                        null // Reset drag selection if the text changes programmatically
-                                    }
+                                    dragSelection.value =
+                                        if (newValue.text == textFieldValue.value.text) newValue.selection else null
 
-
-                                    // Update the local state
                                     textFieldValue.value = newValue
-
-                                    // Save the last known text and update ViewModel
                                     lastKnownText.value = newValue.text
                                     viewModel.updateMessage(newValue.text)
                                 },
@@ -662,7 +661,7 @@ fun MainChatScreen (
                                     focusedTextColor = Color(0xFFBECBD1),
                                     unfocusedTextColor = Color(0xFFBECBD1),
                                     focusedIndicatorColor = Color.Transparent,
-                                    unfocusedIndicatorColor = Color.Transparent, // Optional, makes the indicator disappear
+                                    unfocusedIndicatorColor = Color.Transparent,
                                     focusedLabelColor = Color(0xFF626568),
                                     cursorColor = Color(0xFF626568),
                                     unfocusedContainerColor = Color(0xFF171E2C),
@@ -670,61 +669,140 @@ fun MainChatScreen (
                                 )
                             )
 
-
-
-
                             if (!viewModel.getIsSending()) {
-                                val context = LocalContext.current
-
                                 IconButton(onClick = {
-                                    if(viewModel.loadedModelName.value == ""){
+                                    if (viewModel.loadedModelName.value == "") {
                                         focusManager.clearFocus()
                                         Toast.makeText(context, "Load A Model First", Toast.LENGTH_SHORT).show()
-                                    }
-                                    else {
+                                    } else {
                                         viewModel.send()
                                         focusManager.clearFocus()
                                     }
-                                }
-                                ) {
+                                }) {
                                     Icon(
-                                        modifier = Modifier
-                                            .size(30.dp)
-                                            .weight(1f),
+                                        modifier = Modifier.size(30.dp),
                                         painter = painterResource(id = R.drawable.send_2_svgrepo_com),
                                         contentDescription = "Send",
                                         tint = Color(0xFFDDDDE4)
                                     )
                                 }
-                            } else if (viewModel.getIsSending()) {
-                                IconButton(onClick = {
-                                    viewModel.stop() }) {
+                            } else {
+                                IconButton(onClick = { viewModel.stop() }) {
                                     Icon(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .size(28.dp),
+                                        modifier = Modifier.size(28.dp),
                                         painter = painterResource(id = R.drawable.square_svgrepo_com),
                                         contentDescription = "Stop",
                                         tint = Color(0xFFDDDDE4)
                                     )
                                 }
                             }
-
                         }
                     }
-
-
                 }
             }
+        }
+    }
+}
 
+/* ✅ NEW: chip row (looks like your screenshot) */
+@Composable
+private fun AttachmentChipRow(
+    items: List<PendingAttachment>,
+    onRemove: (Uri) -> Unit,
+) {
+    AnimatedVisibility(visible = items.isNotEmpty()) {
+        LazyRow(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(end = 10.dp)
+        ) {
+            itemsIndexed(items) { _, it ->
+                AttachmentChip(
+                    name = it.name,
+                    mime = it.mime,
+                    onClose = { onRemove(it.uri) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttachmentChip(
+    name: String,
+    mime: String,
+    onClose: () -> Unit,
+) {
+    val ext = name.substringAfterLast('.', "").lowercase()
+    val badge = when {
+        mime == "application/pdf" || ext == "pdf" -> "PDF"
+        ext.isNotBlank() -> ext.uppercase()
+        else -> "FILE"
     }
 
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1020)),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.08f))
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 10.dp, end = 6.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .background(Color(0xFFB3261E), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = badge,
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Spacer(modifier = Modifier.width(10.dp))
+
+            Text(
+                text = name,
+                color = Color.White,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.widthIn(max = 220.dp)
+            )
+
+            Spacer(modifier = Modifier.width(6.dp))
+
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = "Remove",
+                    tint = Color.White.copy(alpha = 0.85f),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
 }
+
+/* ---------------------------
+   The rest of your file below
+   is unchanged
+   --------------------------- */
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsBottomSheet(
     viewModel: MainViewModel,
-    onDismiss: () -> Unit) {
+    onDismiss: () -> Unit
+) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val sheetScrollState = rememberLazyListState()
     ModalBottomSheet(
@@ -733,9 +811,8 @@ fun SettingsBottomSheet(
         containerColor = Color(0xFF01081a),
     ) {
         Column(
-            modifier = Modifier
-                .padding(10.dp)
-        ){
+            modifier = Modifier.padding(10.dp)
+        ) {
             Text(
                 text = "Settings",
                 color = Color.White,
@@ -746,7 +823,7 @@ fun SettingsBottomSheet(
                 textAlign = TextAlign.Center
             )
             LazyColumn(state = sheetScrollState) {
-                item{
+                item {
                     Box(
                         modifier = Modifier
                             .background(
@@ -775,10 +852,7 @@ fun SettingsBottomSheet(
                             )
                             Slider(
                                 value = viewModel.user_thread,
-                                onValueChange = {
-
-                                    viewModel.user_thread = it
-                                },
+                                onValueChange = { viewModel.user_thread = it },
                                 valueRange = 0f..8f,
                                 steps = 7,
                                 colors = SliderDefaults.colors(
@@ -794,31 +868,26 @@ fun SettingsBottomSheet(
                             )
                             Spacer(modifier = Modifier.height(15.dp))
                             Button(
-                                modifier = Modifier
-                                    .fillMaxWidth(),
-
+                                modifier = Modifier.fillMaxWidth(),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color.DarkGray.copy(alpha = 1.0f), // Set the containerColor to transparent
+                                    containerColor = Color.DarkGray.copy(alpha = 1.0f),
                                     contentColor = Color.White,
                                 ),
-                                shape = RoundedCornerShape(8.dp), // Slightly more rounded corners
+                                shape = RoundedCornerShape(8.dp),
                                 elevation = ButtonDefaults.buttonElevation(
                                     defaultElevation = 6.dp,
                                     pressedElevation = 3.dp
                                 ),
                                 onClick = {
                                     viewModel.currentDownloadable?.destination?.path?.let {
-                                        viewModel.load(
-                                            it, viewModel.user_thread.toInt())
+                                        viewModel.load(it, viewModel.user_thread.toInt())
                                     }
                                 }
                             ) {
-
                                 Text("Save")
                             }
                         }
                     }
-
                 }
             }
         }
@@ -832,19 +901,13 @@ fun ScrollToBottomButton(
     messages: List<Any>
 ) {
     val coroutineScope = rememberCoroutineScope()
-
-    // State to track if auto-scrolling is enabled
     var isAutoScrolling by remember { mutableStateOf(false) }
-
-    // State to control the button's visibility
     var isButtonVisible by remember { mutableStateOf(true) }
 
-    // Determine if the user can scroll down
     val canScrollDown by remember {
         derivedStateOf { scrollState.canScrollForward }
     }
 
-    // Continuously scroll to the bottom while auto-scrolling is enabled
     LaunchedEffect(viewModel.messages.size, isAutoScrolling) {
         if (isAutoScrolling) {
             coroutineScope.launch {
@@ -853,15 +916,13 @@ fun ScrollToBottomButton(
         }
     }
 
-    // Stop auto-scrolling when the user scrolls manually
     LaunchedEffect(scrollState.isScrollInProgress) {
         if (scrollState.isScrollInProgress) {
             isAutoScrolling = false
-            isButtonVisible = true // Show the button again if the user scrolls manually
+            isButtonVisible = true
         }
     }
 
-    // Continuously monitor changes in the last item's content
     LaunchedEffect(messages.lastOrNull()) {
         if (isAutoScrolling && messages.isNotEmpty()) {
             coroutineScope.launch {
@@ -875,14 +936,14 @@ fun ScrollToBottomButton(
         contentAlignment = Alignment.BottomCenter
     ) {
         AnimatedVisibility(
-            visible = (canScrollDown || isAutoScrolling) && isButtonVisible, // Show button if needed
+            visible = (canScrollDown || isAutoScrolling) && isButtonVisible,
             enter = fadeIn(),
             exit = fadeOut()
         ) {
             FloatingActionButton(
                 onClick = {
-                    isAutoScrolling = true // Enable auto-scrolling
-                    isButtonVisible = false // Hide the button on click
+                    isAutoScrolling = true
+                    isButtonVisible = false
                     coroutineScope.launch {
                         scrollState.scrollToItem(viewModel.messages.size + 1)
                     }
@@ -890,7 +951,6 @@ fun ScrollToBottomButton(
                 modifier = Modifier
                     .padding(bottom = 16.dp)
                     .size(56.dp),
-                // Ensures a circular shape
                 shape = RoundedCornerShape(percent = 50),
                 containerColor = Color.White.copy(alpha = 0.5f),
                 contentColor = Color.Black
@@ -898,13 +958,12 @@ fun ScrollToBottomButton(
                 Icon(
                     imageVector = Icons.Filled.KeyboardArrowDown,
                     contentDescription = "Scroll to bottom",
-                    tint = Color.White // White icon for better visibility
+                    tint = Color.White
                 )
             }
         }
     }
 }
-
 
 @Composable
 fun ModelSelectorWithDownloadModal(
@@ -912,8 +971,6 @@ fun ModelSelectorWithDownloadModal(
     downloadManager: DownloadManager,
     extFileDir: File?
 ) {
-
-
     val context = LocalContext.current as Activity
     val coroutineScope = rememberCoroutineScope()
 
@@ -922,12 +979,8 @@ fun ModelSelectorWithDownloadModal(
     var mTextFieldSize by remember { mutableStateOf(Size.Zero) }
     var selectedModel by remember { mutableStateOf<Map<String, Any>?>(null) }
 
-    val icon = if (mExpanded)
-        Icons.Filled.KeyboardArrowUp
-    else
-        Icons.Filled.KeyboardArrowDown
+    val icon = if (mExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown
 
-    // Search for local .gguf models
     val localModels = remember(extFileDir) {
         extFileDir?.listFiles { _, name -> name.endsWith(".gguf") }
             ?.map { file ->
@@ -938,17 +991,15 @@ fun ModelSelectorWithDownloadModal(
                 )
             } ?: emptyList()
     }
-    // Combine local and remote models, ensuring uniqueness
+
     val combinedModels = remember(viewModel.allModels, localModels) {
         (viewModel.allModels + localModels).distinctBy { it["name"] }
     }
     viewModel.allModels = combinedModels
 
-
     Column(Modifier.padding(20.dp)) {
-
         OutlinedTextField(
-            value= viewModel.loadedModelName.value,
+            value = viewModel.loadedModelName.value,
             onValueChange = { mSelectedText = it },
             modifier = Modifier
                 .fillMaxWidth()
@@ -957,24 +1008,18 @@ fun ModelSelectorWithDownloadModal(
                 }
                 .pointerInput(Unit) {
                     detectTapGestures(
-                        onTap = {
-                            mExpanded = !mExpanded
-                        },
-                        onPress = {
-                            mExpanded = !mExpanded
-                        }
+                        onTap = { mExpanded = !mExpanded },
+                        onPress = { mExpanded = !mExpanded }
                     )
                 }
-                .clickable {
-                    mExpanded = !mExpanded
-                },
+                .clickable { mExpanded = !mExpanded },
             label = { Text("Select Model") },
             trailingIcon = {
                 Icon(
                     icon,
                     contentDescription = "Toggle dropdown",
                     Modifier.clickable { mExpanded = !mExpanded },
-                    tint =Color(0xFFcfcfd1)
+                    tint = Color(0xFFcfcfd1)
                 )
             },
             textStyle = TextStyle(color = Color(0xFFf5f5f5)),
@@ -989,8 +1034,6 @@ fun ModelSelectorWithDownloadModal(
             )
         )
 
-
-
         DropdownMenu(
             modifier = Modifier
                 .background(Color(0xFF01081a))
@@ -998,9 +1041,7 @@ fun ModelSelectorWithDownloadModal(
                 .padding(top = 2.dp)
                 .border(1.dp, color = Color.LightGray.copy(alpha = 0.5f)),
             expanded = mExpanded,
-            onDismissRequest = {
-                mExpanded = false
-            }
+            onDismissRequest = { mExpanded = false }
         ) {
             viewModel.allModels.forEach { model ->
                 DropdownMenuItem(
@@ -1012,7 +1053,6 @@ fun ModelSelectorWithDownloadModal(
                         selectedModel = model
                         mExpanded = false
 
-                        // Convert model to Downloadable and show modal
                         val downloadable = Downloadable(
                             name = model["name"].toString(),
                             source = Uri.parse(model["source"].toString()),
@@ -1027,9 +1067,6 @@ fun ModelSelectorWithDownloadModal(
                 }
             }
         }
-
-        // Use showModal instead of switchModal
-
     }
 }
 
@@ -1043,8 +1080,6 @@ fun MessageBottomSheet(
     onDismiss: () -> Unit,
     sheetState: SheetState
 ) {
-
-
     ModalBottomSheet(
         sheetState = sheetState,
         containerColor = Color(0xFF01081a),
@@ -1056,16 +1091,13 @@ fun MessageBottomSheet(
                 .padding(20.dp)
                 .background(color = Color(0xFF01081a))
         ) {
-            var sheetScrollState = rememberLazyListState()
+            val sheetScrollState = rememberLazyListState()
 
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxWidth()
                     .padding(vertical = 5.dp)
-
             ) {
-                // Copy Text Button
                 TextButton(
                     colors = ButtonDefaults.buttonColors(Color(0xFF171E2C)),
                     modifier = Modifier
@@ -1080,21 +1112,17 @@ fun MessageBottomSheet(
                     Text(text = "Copy Text", color = Color(0xFFA0A0A5))
                 }
 
-                // Select Text Button
                 TextButton(
                     colors = ButtonDefaults.buttonColors(Color(0xFF171E2C)),
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(vertical = 8.dp),
                     enabled = !viewModel.getIsSending(),
-                    onClick = {
-                        viewModel.toggler = !viewModel.toggler
-                    }
+                    onClick = { viewModel.toggler = !viewModel.toggler }
                 ) {
                     Text(text = "Select Text To Copy", color = Color(0xFFA0A0A5))
                 }
 
-                // Text to Speech Button
                 TextButton(
                     colors = ButtonDefaults.buttonColors(Color(0xFF171E2C)),
                     modifier = Modifier
@@ -1113,11 +1141,9 @@ fun MessageBottomSheet(
                 ) {
                     Text(
                         text = if (viewModel.stateForTextToSpeech) "Text To Speech" else "Stop",
-                        color = Color(0xFFA0A0A5)
-                    )
+                        color = Color(0xFFA0A0A5))
                 }
 
-                // Selection Container
                 LazyColumn(state = sheetScrollState) {
                     item {
                         SelectionContainer {
@@ -1141,5 +1167,4 @@ fun MessageBottomSheet(
             }
         }
     }
-
 }

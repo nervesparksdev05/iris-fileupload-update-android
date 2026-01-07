@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
+        android:name=".irisapp.IrisApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -15,11 +16,9 @@
         android:roundIcon="@drawable/logo"
         android:supportsRtl="true"
         android:theme="@style/Theme.LlamaAndroid"
-        android:windowSplashScreenBackground="#00FF00">
+        android:windowSplashScreenBackground="#00FF00"
+        tools:targetApi="31">
 
-        <activity
-            android:name=".Copy_screen"
-            android:exported="false" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -27,11 +26,12 @@
             android:theme="@style/Theme.LlamaAndroid"
             android:windowBackground="#00FF00"
             android:windowSoftInputMode="adjustResize">
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
     </application>
 

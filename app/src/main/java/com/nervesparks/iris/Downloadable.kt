@@ -1,8 +1,8 @@
 package com.nervesparks.iris
 
 import android.app.DownloadManager
-import android.net.Uri
 import android.util.Log
+import android.widget.Toast
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -10,31 +10,26 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableDoubleStateOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.core.database.getLongOrNull
-import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import android.net.Uri
 
 data class Downloadable(val name: String, val source: Uri, val destination: File) {
+
     companion object {
         @JvmStatic
         private val tag: String? = this::class.qualifiedName
@@ -46,17 +41,16 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
         data class Error(val message: String) : State
         data object Stopped : State
 
-
-
         @JvmStatic
         @Composable
         fun Button(viewModel: MainViewModel, dm: DownloadManager, item: Downloadable) {
+            val context = LocalContext.current
+            val coroutineScope = rememberCoroutineScope()
 
-            var status: State by remember  {
+            var status: State by remember {
                 mutableStateOf(
                     when (val downloadId = getActiveDownloadId(dm, item)) {
                         null -> {
-
                             if (item.destination.exists() && item.destination.length() > 0 && !isPartialDownload(item.destination)) {
                                 Downloaded(item)
                             } else {
@@ -67,78 +61,60 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
                     }
                 )
             }
-            var progress by rememberSaveable  { mutableDoubleStateOf(0.0) }
-            var totalSize by rememberSaveable  { mutableStateOf<Long?>(null) }
 
-            val coroutineScope = rememberCoroutineScope()
+            var progress by rememberSaveable { mutableDoubleStateOf(0.0) }
+            var totalSize by rememberSaveable { mutableStateOf<Long?>(null) }
 
             suspend fun waitForDownload(result: Downloading, item: Downloadable): State {
                 while (true) {
                     val cursor = dm.query(DownloadManager.Query().setFilterById(result.id))
-
-                    if (cursor == null) {
-                        Log.e(tag, "dm.query() returned null")
-                        return Error("dm.query() returned null")
-                    }
+                        ?: return Error("DownloadManager query returned null")
 
                     if (!cursor.moveToFirst() || cursor.count < 1) {
                         cursor.close()
-                        Log.i(tag, "cursor.moveToFirst() returned false or cursor.count < 1, download canceled?")
                         return Ready
                     }
 
-                    val pix = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
-                    val tix = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
-                    val sofar = cursor.getLongOrNull(pix) ?: 0
-                    val total = cursor.getLongOrNull(tix) ?: 1
-                    totalSize = total
-                    cursor.close()
+                    val st = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                    val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
 
-                    if (sofar == total) {
-                        Log.d(tag, "Download complete: ${item.destination.path}")
+                    if (st == DownloadManager.STATUS_FAILED) {
+                        cursor.close()
+                        Log.e(tag, "Download FAILED for ${item.name} reason=$reason")
+                        return Error("Download failed. reason=$reason")
+                    }
 
-//                         Ensure model is added dynamically
+                    if (st == DownloadManager.STATUS_SUCCESSFUL) {
+                        cursor.close()
+                        Log.d(tag, "Download SUCCESSFUL: ${item.destination.path}")
+
                         withContext(Dispatchers.Main) {
                             if (!viewModel.allModels.any { it["name"] == item.name }) {
-                                println("testing")
-                                println(item.source.toString())
                                 val newModel = mapOf(
                                     "name" to item.name,
                                     "source" to item.source.toString(),
                                     "destination" to item.destination.path
                                 )
                                 viewModel.allModels = viewModel.allModels + newModel
-                                Log.d(tag, "Model dynamically added to viewModel: $newModel")
+                                Log.d(tag, "Model added to viewModel: $newModel")
                             }
                         }
-//                        val newModel = mapOf(
-//                            "name" to item.name,
-//                            "source" to item.source.toString(),
-//                            "destination" to item.destination.path
-//                        )
-//                        viewModel.allModels = viewModel.allModels + newModel
-//                        Log.d(tag, "Model dynamically added to viewModel: $newModel")
 
                         viewModel.currentDownloadable = item
-                        if(viewModel.loadedModelName.value == "") {
-                            viewModel.load(
-                                item.destination.path,
-                                userThreads = viewModel.user_thread.toInt()
-                            )
+                        if (viewModel.loadedModelName.value.isBlank()) {
+                            viewModel.load(item.destination.path, userThreads = viewModel.user_thread.toInt())
                         }
 
-                        println(viewModel.allModels.any {it["name"] == item.name})
-                        if (!viewModel.allModels.any { it["name"] == item.name }) {
-                            val newModel = mapOf(
-                                "name" to item.name,
-                                "source" to item.source.toString(),
-                                "destination" to item.destination.path
-                            )
-                            viewModel.allModels += newModel
-                            Log.d(tag, "Outer : Model dynamically added to viewModel: $newModel")
-                        }
                         return Downloaded(item)
                     }
+
+                    val pix = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                    val tix = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                    val sofar = cursor.getLongOrNull(pix) ?: 0
+                    val total = cursor.getLongOrNull(tix)?.takeIf { it > 0 } ?: 1
+
+                    totalSize = if (total == 1L) null else total
+                    cursor.close()
 
                     progress = (sofar * 1.0) / total
                     delay(1000L)
@@ -150,36 +126,54 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
                     status = waitForDownload(status as Downloading, item)
                 }
             }
+
             fun onClick() {
                 when (val s = status) {
                     is Downloaded -> {
                         viewModel.showModal = true
-                        Log.d("item.destination.path", item.destination.path.toString())
                         viewModel.currentDownloadable = item
                         viewModel.load(item.destination.path, userThreads = viewModel.user_thread.toInt())
                     }
 
                     is Downloading -> {
-                        Log.d("Downloading", "Already downloading in background")
+                        Log.d(tag, "Already downloading")
                     }
 
                     else -> {
                         val request = DownloadManager.Request(item.source).apply {
                             setTitle("Downloading model")
                             setDescription("Downloading model: ${item.name}")
-                            setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE)
-                            setDestinationUri(item.destination.toUri())
+                            setAllowedNetworkTypes(
+                                DownloadManager.Request.NETWORK_WIFI or DownloadManager.Request.NETWORK_MOBILE
+                            )
+                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+
+                            // ✅ MOST IMPORTANT FIX:
+                            setDestinationInExternalFilesDir(
+                                context,
+                                null,
+                                item.destination.name
+                            )
                         }
 
-                        val id = dm.enqueue(request)
-                        status = Downloading(id, -1L) // Dynamically update status
+                        val id = try {
+                            dm.enqueue(request)
+                        } catch (e: Exception) {
+                            Log.e(tag, "Download enqueue failed for ${item.name}", e)
+                            Toast.makeText(context, "Download failed: ${e.message}", Toast.LENGTH_LONG).show()
+                            status = Error(e.message ?: "enqueue failed")
+                            return
+                        }
+
+                        Toast.makeText(context, "Download started: ${item.name}", Toast.LENGTH_SHORT).show()
+                        status = Downloading(id, -1L)
+
                         coroutineScope.launch {
                             status = waitForDownload(Downloading(id, -1L), item)
                         }
                     }
                 }
             }
-
 
             fun onStop() {
                 if (status is Downloading) {
@@ -188,16 +182,11 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
                 }
             }
 
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Button(
                     onClick = { onClick() },
                     enabled = status !is Downloading && !viewModel.getIsSending(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF2563EB) // Navy Blue color
-                    ),
-
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
                 ) {
                     when (status) {
                         is Downloading -> Text(
@@ -210,37 +199,19 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
                             color = Color.White
                         )
 
-                        is Downloaded -> Text(
-                            "Load",
-                            color = Color.White
-                        )
-
-                        is Ready -> Text(
-                            "Download",
-                            color = Color.White
-                        )
-
-                        is Error -> Text(
-                            "Download}",
-                            color = Color.White
-                        )
-
-                        is Stopped -> Text(
-                            "Stopped",
-                            color = Color.White
-                        )
+                        is Downloaded -> Text("Load", color = Color.White)
+                        is Ready -> Text("Download", color = Color.White)
+                        is Error -> Text("Retry", color = Color.White)
+                        is Stopped -> Text("Stopped", color = Color.White)
                     }
                 }
-
 
                 Spacer(Modifier.height(10.dp))
 
                 if (status is Downloading) {
                     Button(
                         onClick = { onStop() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color.White // Red color for stop button
-                        )
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White)
                     ) {
                         Text("Stop Download", color = Color.Black)
                     }
@@ -258,32 +229,10 @@ data class Downloadable(val name: String, val source: Uri, val destination: File
     }
 }
 
-
-fun isAlreadyDownloading(dm: DownloadManager, item: Downloadable): Boolean {
-    val query = DownloadManager.Query()
-        .setFilterByStatus(DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PENDING)
-
-    val cursor = dm.query(query)
-
-    cursor?.use {
-        while (it.moveToNext()) {
-            val uriIndex = it.getColumnIndex(DownloadManager.COLUMN_URI)
-            val currentUri = it.getString(uriIndex)
-            if (currentUri == item.source.toString()) {
-                Log.d("CheckDownload", "Item is already downloading or pending.")
-                return true
-            }
-        }
-    }
-    return false
-}
-
-private fun isPartialDownload(file: File): Boolean {
-
+fun isPartialDownload(file: File): Boolean {
     return file.name.endsWith(".partial") ||
             file.name.endsWith(".download") ||
             file.name.endsWith(".tmp") ||
-
             file.name.contains(".part")
 }
 

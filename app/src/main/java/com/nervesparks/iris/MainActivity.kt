@@ -138,20 +138,13 @@ class MainActivity(
 //        viewModel.log("Downloads directory: ${getExternalFilesDir(null)}")
 
 
-        val extFilesDir = getExternalFilesDir(null)
+        val extFilesDir = getExternalFilesDir(null) ?: filesDir
 
         val models = listOf(
-//            Downloadable(
-//                "SmolLM-135M.Q2_K.gguf",
-//                Uri.parse("https://huggingface.co/QuantFactory/SmolLM-135M-GGUF/resolve/main/SmolLM-135M.Q2_K.gguf?download=true"),
-//                File(extFilesDir, "SmolLM-135M.Q2_K.gguf")
-//
-//            ),
             Downloadable(
                 "Llama-3.2-3B-Instruct-Q4_K_L.gguf",
                 Uri.parse("https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_L.gguf?download=true"),
                 File(extFilesDir, "Llama-3.2-3B-Instruct-Q4_K_L.gguf")
-
             ),
             Downloadable(
                 "Llama-3.2-1B-Instruct-Q6_K_L.gguf",
@@ -165,9 +158,9 @@ class MainActivity(
             )
         )
 
-        if (extFilesDir != null) {
-            viewModel.loadExistingModels(extFilesDir)
-        }
+// ✅ always safe now (never null)
+        viewModel.loadExistingModels(extFilesDir)
+
 
 
 
@@ -417,7 +410,7 @@ fun LinearGradient() {
 
 
 
-// [END android_compose_layout_material_modal_drawer]
+
 
 
 
