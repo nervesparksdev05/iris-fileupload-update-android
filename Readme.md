@@ -182,7 +182,6 @@ After installing the app:
 
 | Model | Size | Quantization | Speed | Quality | Best For |
 |-------|------|--------------|-------|---------|----------|
-| **TinyLlama 1.1B** | ~600MB | Q4_K_M | ⚡⚡⚡ | ⭐⭐ | Quick responses, low-end devices |
 | **Llama 3.2-1B** | ~800MB | Q6_K_L | ⚡⚡ | ⭐⭐⭐ | Balanced performance |
 | **Llama 3.2-3B** | ~1.9GB | Q4_K_L | ⚡ | ⭐⭐⭐⭐ | Best quality for most devices |
 | **StableLM 1.6B** | ~1GB | Q4_K_M | ⚡⚡ | ⭐⭐⭐ | Good balance |
