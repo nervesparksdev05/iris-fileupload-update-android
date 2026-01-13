@@ -13,8 +13,9 @@ import com.nervesparks.iris.rag.ingest.TextNormalize
 import com.nervesparks.iris.rag.storage.LocalChunk
 import com.nervesparks.iris.rag.storage.LocalDoc
 import com.nervesparks.iris.rag.util.FloatPacking
+import java.io.File
 import java.util.UUID
-import kotlin.math.abs
+import kotlin.math.max
 
 class IndexDocumentWorker(
     appContext: Context,
@@ -32,9 +33,8 @@ class IndexDocumentWorker(
         val createdAt = inputData.getLong(KEY_CREATED_AT, System.currentTimeMillis())
 
         val store = ServiceLocator.localRagStore
-        val embedder = ServiceLocator.embedder
 
-        // mark indexing
+        // Mark indexing
         store.writeDocMeta(
             LocalDoc(
                 docId = docId,
@@ -48,53 +48,63 @@ class IndexDocumentWorker(
             )
         )
 
+        if (!ServiceLocator.ensureEmbeddingReady(applicationContext)) {
+            return failDoc(
+                docId, uriStr, name, mime, sizeBytes, createdAt,
+                "Embedding model not downloaded. Download it from Settings → Models."
+            )
+        }
+
+        val embedder = ServiceLocator.embedder
+
         return try {
             val uri = Uri.parse(uriStr)
 
+            // ✅ extractor now throws if empty/low-quality
             val extracted = DocumentTextExtractor.extractTextFromUri(
                 context = applicationContext,
                 uri = uri
             )
 
-            val normalized = TextNormalize.normalize(extracted)
+            var normalized = TextNormalize.normalize(extracted).trim()
             if (normalized.isBlank()) {
-                store.writeDocMeta(
-                    LocalDoc(
-                        docId = docId,
-                        uri = uriStr,
-                        name = name,
-                        mime = mime,
-                        sizeBytes = sizeBytes,
-                        createdAt = createdAt,
-                        status = "FAILED",
-                        error = "No text extracted (empty after normalize)."
-                    )
+                return failDoc(
+                    docId, uriStr, name, mime, sizeBytes, createdAt,
+                    "No text extracted (empty after normalize)."
                 )
-                return Result.failure(workDataOf("error" to "No text extracted"))
             }
 
-            val chunks = Chunker.chunkText(normalized, targetChars = 1400, overlapChars = 250)
-            if (chunks.isEmpty()) {
-                store.writeDocMeta(
-                    LocalDoc(
-                        docId = docId,
-                        uri = uriStr,
-                        name = name,
-                        mime = mime,
-                        sizeBytes = sizeBytes,
-                        createdAt = createdAt,
-                        status = "FAILED",
-                        error = "Chunker produced 0 chunks."
-                    )
+            // ✅ second safety dedupe (removes repeated headers that survive normalize)
+            normalized = removeRepeatingLines(normalized)
+
+            // ✅ If still too small, fail fast to avoid garbage indexing
+            if (normalized.length < 350) {
+                return failDoc(
+                    docId, uriStr, name, mime, sizeBytes, createdAt,
+                    "Extracted text too small after cleanup. PDF may be scanned or layout is unsupported."
                 )
-                return Result.failure(workDataOf("error" to "0 chunks"))
             }
+
+            val chunks = Chunker.chunkText(
+                normalized,
+                targetChars = 900,
+                overlapChars = 250
+            )
+
+            if (chunks.isEmpty()) {
+                return failDoc(
+                    docId, uriStr, name, mime, sizeBytes, createdAt,
+                    "Chunker produced 0 chunks."
+                )
+            }
+
+            Log.i(TAG, "Created ${chunks.size} chunks for docId=$docId name=$name")
 
             val localChunks = ArrayList<LocalChunk>(chunks.size)
             val allEmbBytes = ByteArrayOutput()
 
             for (c in chunks) {
-                val emb = embedder.embed(c.text) // FloatArray
+                val emb = embedder.embed(c.text)
                 val chunkId = UUID.randomUUID().toString()
 
                 localChunks.add(
@@ -127,27 +137,80 @@ class IndexDocumentWorker(
                 )
             )
 
+            runCatching { deleteLocalFileIfPossible(uri) }
+
+            Log.i(TAG, "Indexed docId=$docId name=$name chunks=${chunks.size}")
             Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "IndexDocumentWorker FAILED docId=$docId uri=$uriStr name=$name", e)
-
-            store.writeDocMeta(
-                LocalDoc(
-                    docId = docId,
-                    uri = uriStr,
-                    name = name,
-                    mime = mime,
-                    sizeBytes = sizeBytes,
-                    createdAt = createdAt,
-                    status = "FAILED",
-                    error = (e.message ?: e.toString())
-                )
+            failDoc(
+                docId, uriStr, name, mime, sizeBytes, createdAt,
+                (e.message ?: e.toString())
             )
-            Result.failure(workDataOf("error" to (e.message ?: e.toString())))
         }
     }
 
-    // Small helper to build big ByteArray without reallocating too much
+    private fun failDoc(
+        docId: String,
+        uriStr: String,
+        name: String,
+        mime: String,
+        sizeBytes: Long,
+        createdAt: Long,
+        error: String
+    ): Result {
+        val store = ServiceLocator.localRagStore
+        store.writeDocMeta(
+            LocalDoc(
+                docId = docId,
+                uri = uriStr,
+                name = name,
+                mime = mime,
+                sizeBytes = sizeBytes,
+                createdAt = createdAt,
+                status = "FAILED",
+                error = error
+            )
+        )
+        return Result.failure(workDataOf("error" to error))
+    }
+
+    private fun deleteLocalFileIfPossible(uri: Uri) {
+        if (uri.scheme != "file") return
+        val path = uri.path ?: return
+        val f = File(path)
+        if (f.exists()) {
+            val ok = f.delete()
+            Log.i(TAG, "Deleted local copy: $path ok=$ok")
+        }
+    }
+
+    /**
+     * Removes repeated short lines that appear many times (resume name/header spam).
+     */
+    private fun removeRepeatingLines(text: String): String {
+        val lines = text.lines().map { it.trim() }.filter { it.isNotBlank() }
+        if (lines.size < 12) return text
+
+        val freq = HashMap<String, Int>()
+        for (l in lines) {
+            val key = l.lowercase().replace(Regex("\\s+"), " ")
+            freq[key] = (freq[key] ?: 0) + 1
+        }
+
+        val filtered = lines.filter { l ->
+            val key = l.lowercase().replace(Regex("\\s+"), " ")
+            val count = freq[key] ?: 0
+            val isShort = key.length <= 60
+            val isRepeated = count >= 3
+            !(isShort && isRepeated)
+        }
+
+        val out = filtered.joinToString("\n")
+        return if (out.length >= max(120, text.length / 4)) out else text
+    }
+
+    // Helper: build big ByteArray without reallocating too much
     private class ByteArrayOutput {
         private var buf = ByteArray(1024 * 16)
         private var size = 0

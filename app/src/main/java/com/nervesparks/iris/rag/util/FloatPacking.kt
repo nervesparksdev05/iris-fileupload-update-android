@@ -16,4 +16,13 @@ object FloatPacking {
         for (i in out.indices) out[i] = bb.getFloat()
         return out
     }
+
+    fun readFloatLE(bytes: ByteArray, offset: Int): Float {
+        val bits =
+            (bytes[offset].toInt() and 0xFF) or
+                    ((bytes[offset + 1].toInt() and 0xFF) shl 8) or
+                    ((bytes[offset + 2].toInt() and 0xFF) shl 16) or
+                    ((bytes[offset + 3].toInt() and 0xFF) shl 24)
+        return Float.fromBits(bits)
+    }
 }

@@ -22,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -43,36 +44,23 @@ class MainViewModel(
     private val _defaultModelName = mutableStateOf("")
     val defaultModelName: State<String> = _defaultModelName
 
-    // -----------------------------
-    // 📎 User documents (Production RAG)
-    // -----------------------------
     val indexedDocs = ragRepo.observeDocs()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun clearUserDocs() {
         viewModelScope.launch(Dispatchers.IO) {
-            indexedDocs.value.forEach { ragRepo.removeDocument(it.docId) }
+            val docs = ragRepo.snapshotDocs()
+            docs.forEach { ragRepo.removeDocument(it.docId) }
         }
     }
 
     fun removeUserDoc(docId: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            ragRepo.removeDocument(docId)
-        }
+        viewModelScope.launch(Dispatchers.IO) { ragRepo.removeDocument(docId) }
     }
 
-    /**
-     * ✅ Updated behavior (FIX):
-     * - Persist URI permission (best-effort)
-     * - Copy picked docs into internal storage -> stable file:// URIs
-     * - Add those stable URIs to RAG pipeline (Room + Worker)
-     *
-     * Why: WorkManager runs later/in another process; content:// URIs often fail then.
-     */
     fun addUserDocs(context: Context, uris: List<Uri>) {
         if (uris.isEmpty()) return
 
-        // 1) Best-effort persist permission (for content://)
         uris.forEach { uri ->
             try {
                 DocumentUriPermission.persistReadPermission(context, uri)
@@ -81,8 +69,6 @@ class MainViewModel(
             }
         }
 
-        // 2) Copy into app-internal storage so Worker can always read it later (file://).
-        //    This keeps the app fully offline + stable across reboots.
         viewModelScope.launch(Dispatchers.IO) {
             val stableUris = ArrayList<Uri>(uris.size)
 
@@ -92,9 +78,7 @@ class MainViewModel(
                     .onFailure { t -> Log.e(TAG, "Failed to copy uri=$uri into app storage", t) }
             }
 
-            if (stableUris.isNotEmpty()) {
-                ragRepo.addDocuments(stableUris)
-            }
+            if (stableUris.isNotEmpty()) ragRepo.addDocuments(stableUris)
         }
     }
 
@@ -108,8 +92,7 @@ class MainViewModel(
         val displayName = meta?.displayName ?: (uri.lastPathSegment ?: "document")
         val safeName = sanitizeFileName(displayName)
 
-        // Safety cap for local copy (tune as needed)
-        val maxBytes = 100L * 1024L * 1024L // 100 MB
+        val maxBytes = 100L * 1024L * 1024L
         if ((meta?.sizeBytes ?: 0L) > maxBytes) {
             throw IllegalStateException("File too large for offline indexing: ${meta?.sizeBytes} bytes")
         }
@@ -119,7 +102,7 @@ class MainViewModel(
 
         resolver.openInputStream(uri)?.use { input ->
             outFile.outputStream().use { output ->
-                val buf = ByteArray(1024 * 256)
+                val buf = ByteArray(256 * 1024)
                 var total = 0L
                 while (true) {
                     val n = input.read(buf)
@@ -143,28 +126,112 @@ class MainViewModel(
         return cleaned.take(120)
     }
 
+    // -----------------------------
+    // ✅ PROMPT WINDOWING
+    // -----------------------------
+    private fun windowedMessages(msgs: List<Map<String, String>>, keepLast: Int = 10): List<Map<String, String>> {
+        val sys = msgs.firstOrNull { it["role"] == "system" }
+        val rest = msgs.filter { it["role"] != "system" }.takeLast(keepLast)
+        return if (sys != null) listOf(sys) + rest else rest
+    }
+
     /**
-     * ✅ Merge docContext into first system message
+     * ✅ IMPROVED: Strict document-only mode with clear instructions for all models
+     * When documents are uploaded, the model can ONLY answer from documents.
      */
-    private fun withDocContext(
+    private fun injectDocContextTransient(
         msgs: List<Map<String, String>>,
-        docContext: String
+        docExcerpts: String?,
+        hasReadyDocs: Boolean
     ): List<Map<String, String>> {
-        val idx = msgs.indexOfFirst { it["role"] == "system" }
-        return if (idx >= 0) {
-            val old = msgs[idx]["content"].orEmpty()
-            val merged = old + "\n\n" + docContext
-            msgs.toMutableList().apply {
-                set(idx, msgs[idx] + ("content" to merged))
+        // ✅ If no documents are ready, return normal conversation
+        if (!hasReadyDocs) return msgs
+
+        // ✅ If documents exist but no excerpts retrieved, force document-only mode
+        if (docExcerpts.isNullOrBlank()) {
+            val strictRule = mapOf(
+                "role" to "system",
+                "content" to """
+DOCUMENT MODE ACTIVE: You have access to uploaded documents.
+
+CRITICAL RULES - YOU MUST FOLLOW THESE:
+1. You can ONLY answer questions using information from the uploaded documents
+2. If the answer is NOT in the documents, you MUST respond with: "I cannot find this information in the uploaded documents."
+3. NEVER use your general knowledge or training data
+4. NEVER make up, guess, or invent information
+5. Always cite your source like this: [Document Name §Section]
+
+STATUS: No relevant excerpts found for this specific question. You must say you cannot find the information.
+""".trimIndent()
+            )
+
+            val sysIdx = msgs.indexOfFirst { it["role"] == "system" }
+            return if (sysIdx >= 0) {
+                msgs.toMutableList().apply { add(sysIdx + 1, strictRule) }
+            } else {
+                listOf(strictRule) + msgs
             }
+        }
+
+        // ✅ When excerpts are available, provide them with very strict instructions
+        val strictRule = mapOf(
+            "role" to "system",
+            "content" to """
+DOCUMENT MODE ACTIVE: Answer ONLY using the document excerpts provided below.
+
+CRITICAL RULES - YOU MUST FOLLOW THESE:
+1. Use ONLY the information from the excerpts below
+2. If the answer is NOT in the excerpts, say: "I cannot find this information in the uploaded documents."
+3. NEVER use your general knowledge or training data
+4. NEVER make up, guess, or invent information
+5. Always cite your source like this: [Document Name §Section]
+6. Do NOT repeat or paste large portions of the excerpts unless specifically asked
+
+DOCUMENT EXCERPTS:
+$docExcerpts
+
+REMINDER: Answer ONLY from the excerpts above. If the information is not there, say so explicitly.
+""".trimIndent()
+        )
+
+        val sysIdx = msgs.indexOfFirst { it["role"] == "system" }
+        return if (sysIdx >= 0) {
+            msgs.toMutableList().apply { add(sysIdx + 1, strictRule) }
         } else {
-            listOf(mapOf("role" to "system", "content" to docContext)) + msgs
+            listOf(strictRule) + msgs
         }
     }
 
-    init {
-        loadDefaultModelName()
+    // -----------------------------
+    // ✅ IMPROVED ROUTER - Always use docs when documents are ready
+    // -----------------------------
+    private fun shouldUseDocs(
+        userMessage: String,
+        readyDocsCount: Int,
+        bestScore: Double,
+        secondScore: Double,
+        hitsCount: Int,
+        lastWasDocs: Boolean
+    ): Pair<Boolean, String> {
+        // ✅ KEY CHANGE: If ANY documents are ready, ALWAYS use document mode
+        // This ensures strict document-only behavior when documents exist
+        if (readyDocsCount == 0) return false to "no_ready_docs"
+
+        // ✅ Once documents are uploaded, we're ALWAYS in document mode
+        return true to "documents_uploaded"
     }
+
+    // Sticky doc mode tracking (kept for compatibility but simplified behavior)
+    private var lastRouteWasDocs by mutableStateOf(false)
+    private var docModeTurnsLeft by mutableIntStateOf(0)
+
+    // ✅ lock retrieval to a single doc during follow-ups
+    private var lockedDocId: String? by mutableStateOf(null)
+
+    // ✅ reuse previous context for follow-up questions
+    private var lastDocContext: String? by mutableStateOf(null)
+
+    init { loadDefaultModelName() }
 
     private fun loadDefaultModelName() {
         _defaultModelName.value = userPreferencesRepository.getDefaultModelName()
@@ -207,6 +274,18 @@ class MainViewModel(
         )
     )
 
+    var embeddingModels by mutableStateOf(
+        listOf(
+            mapOf(
+                "name" to "bge-small-en-v1.5-q4_k_m.gguf",
+                "source" to "https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q4_k_m.gguf",
+                "destination" to "bge-small-en-v1.5-q4_k_m.gguf",
+                "size" to "~25MB",
+                "description" to "Required for document indexing & search"
+            )
+        )
+    )
+
     private var first by mutableStateOf(true)
     var userSpecifiedThreads by mutableIntStateOf(2)
 
@@ -228,23 +307,15 @@ class MainViewModel(
         directory.listFiles { file -> file.extension == "gguf" }?.forEach { file ->
             val modelName = file.name
             if (!allModels.any { it["name"] == modelName }) {
-                allModels += mapOf(
-                    "name" to modelName,
-                    "source" to "local",
-                    "destination" to file.name
-                )
+                allModels += mapOf("name" to modelName, "source" to "local", "destination" to file.name)
             }
         }
 
         if (defaultModelName.value.isNotEmpty()) {
-            val loadedDefaultModel = allModels.find { model ->
-                model["name"] == defaultModelName.value
-            }
+            val loadedDefaultModel = allModels.find { it["name"] == defaultModelName.value }
             if (loadedDefaultModel != null) {
                 val destinationPath = File(directory, loadedDefaultModel["destination"].toString())
-                if (loadedModelName.value == "") {
-                    load(destinationPath.path, userThreads = user_thread.toInt())
-                }
+                if (loadedModelName.value == "") load(destinationPath.path, userThreads = user_thread.toInt())
                 currentDownloadable = Downloadable(
                     loadedDefaultModel["name"].toString(),
                     Uri.parse(loadedDefaultModel["source"].toString()),
@@ -252,13 +323,9 @@ class MainViewModel(
                 )
             }
         } else {
-            allModels.find { model ->
-                File(directory, model["destination"].toString()).exists()
-            }?.let { model ->
+            allModels.find { File(directory, it["destination"].toString()).exists() }?.let { model ->
                 val destinationPath = File(directory, model["destination"].toString())
-                if (loadedModelName.value == "") {
-                    load(destinationPath.path, userThreads = user_thread.toInt())
-                }
+                if (loadedModelName.value == "") load(destinationPath.path, userThreads = user_thread.toInt())
                 currentDownloadable = Downloadable(
                     model["name"].toString(),
                     Uri.parse(model["source"].toString()),
@@ -284,11 +351,9 @@ class MainViewModel(
                             override fun onDone(utteranceId: String?) {
                                 CoroutineScope(Dispatchers.Main).launch { stateForTextToSpeech = true }
                             }
-
                             override fun onError(utteranceId: String?) {
                                 CoroutineScope(Dispatchers.Main).launch { stateForTextToSpeech = true }
                             }
-
                             override fun onStart(utteranceId: String?) {
                                 CoroutineScope(Dispatchers.Main).launch { stateForTextToSpeech = false }
                             }
@@ -302,10 +367,7 @@ class MainViewModel(
     }
 
     fun stopTextToSpeech() {
-        textToSpeech?.apply {
-            stop()
-            shutdown()
-        }
+        textToSpeech?.apply { stop(); shutdown() }
         textToSpeech = null
         stateForTextToSpeech = true
     }
@@ -321,63 +383,161 @@ class MainViewModel(
         super.onCleared()
 
         viewModelScope.launch {
-            try {
-                llamaAndroid.unload()
-            } catch (exc: IllegalStateException) {
-                addMessage("error", exc.message ?: "")
-            }
+            try { llamaAndroid.unload() }
+            catch (exc: IllegalStateException) { addMessage("error", exc.message ?: "") }
         }
     }
 
     fun send() {
-        val userMessage = removeExtraWhiteSpaces(message)
+        val userMessage = removeExtraWhiteSpaces(message).trim()
         message = ""
+        if (userMessage.isBlank()) return
 
-        if (userMessage.isNotBlank()) {
-            if (first) {
+        if (first) {
+            addMessage(
+                "system",
+                "This is a conversation between User and Iris, a friendly chatbot. Iris is helpful, kind, honest, good at writing, and answers requests with precision."
+            )
+            addMessage("user", "Hi")
+            addMessage("assistant", "How may I help you?")
+            first = false
+        }
+
+        addMessage("user", userMessage)
+
+        viewModelScope.launch {
+            val docsSnapshot = withContext(Dispatchers.IO) { ragRepo.snapshotDocs() }
+            val readyDocs = docsSnapshot.filter { it.status.equals("READY", ignoreCase = true) }
+
+            val explicitFileAsk =
+                userMessage.contains("file", true) ||
+                        userMessage.contains("document", true) ||
+                        userMessage.contains("pdf", true)
+
+            if (explicitFileAsk && readyDocs.isEmpty()) {
+                val indexing = docsSnapshot.any { it.status.equals("INDEXING", ignoreCase = true) }
                 addMessage(
-                    "system",
-                    "This is a conversation between User and Iris, a friendly chatbot. Iris is helpful, kind, honest, good at writing, and never fails to answer any requests immediately and with precision."
+                    "assistant",
+                    if (indexing) "I'm still indexing your document(s). Try again once indexing finishes."
+                    else "I don't have any indexed documents yet. Please upload a document first."
                 )
-                addMessage("user", "Hi")
-                addMessage("assistant", "How may I help You?")
-                first = false
+                return@launch
             }
 
-            addMessage("user", userMessage)
+            val preferredDoc = readyDocs.maxByOrNull { it.createdAt }
 
-            viewModelScope.launch {
-                val hits = withContext(Dispatchers.IO) {
-                    ragRepo.retrieve(userMessage, topK = 6)
+            // If user explicitly asks about docs, lock to latest READY doc immediately
+            if (explicitFileAsk && lockedDocId == null) {
+                lockedDocId = preferredDoc?.docId
+            }
+
+            val retrievalQuery = userMessage
+
+            // ✅ restrict retrieval to locked doc during doc-mode followups
+            val docFilter = if (docModeTurnsLeft > 0 || explicitFileAsk) lockedDocId else null
+
+            val hits = withContext(Dispatchers.IO) {
+                if (readyDocs.isEmpty()) emptyList()
+                else ragRepo.retrieve(
+                    query = retrievalQuery,
+                    topK = 5,  // ✅ Increased from 2-3 to get more context
+                    scoreThreshold = 0.08,  // ✅ Lowered threshold to be more permissive
+                    docIdFilter = docFilter
+                )
+            }
+
+            val best = hits.firstOrNull()?.score ?: 0.0
+            val second = hits.getOrNull(1)?.score ?: 0.0
+
+            // ✅ Use improved router - always true when docs exist
+            val (useDocs, reason) = shouldUseDocs(
+                userMessage = userMessage,
+                readyDocsCount = readyDocs.size,
+                bestScore = best,
+                secondScore = second,
+                hitsCount = hits.size,
+                lastWasDocs = lastRouteWasDocs
+            )
+
+            // Update tracking (kept for potential future use)
+            lastRouteWasDocs = useDocs
+            if (useDocs) {
+                docModeTurnsLeft = 2
+                if (lockedDocId == null) {
+                    lockedDocId = preferredDoc?.docId ?: hits.firstOrNull()?.docId
                 }
-                val docContext = ragRepo.buildContextBlock(hits)
+            } else {
+                docModeTurnsLeft = 0
+                lockedDocId = null
+                lastDocContext = null
+            }
 
-                val messagesForModel = if (!docContext.isNullOrBlank()) {
-                    withDocContext(messages, docContext)
-                } else {
-                    messages
+            Log.i(
+                TAG,
+                "route: useDocs=$useDocs reason=$reason ready=${readyDocs.size} hits=${hits.size} best=$best second=$second lockedDocId=$lockedDocId"
+            )
+
+            // ✅ Build context with fallback options
+            val docExcerpts: String? = when {
+                useDocs && hits.isNotEmpty() -> {
+                    // Has good retrieval hits
+                    ragRepo.buildContextBlock(hits, maxChars = 1200)
+                        .also { lastDocContext = it }
                 }
+                useDocs && lockedDocId != null -> {
+                    // No hits but we have a locked doc - get top chunks
+                    val fallback = withContext(Dispatchers.IO) {
+                        ragRepo.fallbackTopChunksForDoc(lockedDocId!!, maxChunks = 6)
+                    }
+                    ragRepo.buildContextBlock(fallback, maxChars = 900)
+                        .also { lastDocContext = it }
+                }
+                useDocs -> {
+                    // In doc mode but no specific context - will trigger "not found" response
+                    null
+                }
+                else -> null
+            }
 
-                try {
-                    llamaAndroid.send(llamaAndroid.getTemplate(messagesForModel))
-                        .catch {
-                            Log.e(TAG, "send() failed", it)
-                            addMessage("error", it.message ?: "")
+            // ✅ Build prompt with strict document-only mode
+            var base = windowedMessages(messages, keepLast = 10)
+            val messagesForModel = injectDocContextTransient(base, docExcerpts, readyDocs.isNotEmpty())
+
+            var template = llamaAndroid.getTemplate(messagesForModel)
+            var promptLen = template.length
+
+            if (promptLen > 18_000) {
+                base = windowedMessages(messages, keepLast = 6)
+                val shrunken = injectDocContextTransient(base, docExcerpts, readyDocs.isNotEmpty())
+                template = llamaAndroid.getTemplate(shrunken)
+                promptLen = template.length
+                Log.w(TAG, "prompt too big; reduced keepLast=6 newPromptChars=$promptLen")
+            }
+
+            var firstTokenLogged = false
+            val tSendStart = System.currentTimeMillis()
+
+            try {
+                llamaAndroid.send(template)
+                    .catch {
+                        Log.e(TAG, "send() failed", it)
+                        addMessage("error", it.message ?: "")
+                    }
+                    .collect { response ->
+                        if (!firstTokenLogged) {
+                            firstTokenLogged = true
+                            Log.i(TAG, "timing: firstToken=${System.currentTimeMillis() - tSendStart}ms")
                         }
-                        .collect { response ->
-                            if (getIsMarked()) addMessage("codeBlock", response)
-                            else addMessage("assistant", response)
-                        }
-                } finally {
-                    if (!getIsCompleteEOT()) trimEOT()
-                }
+                        if (getIsMarked()) addMessage("codeBlock", response)
+                        else addMessage("assistant", response)
+                    }
+            } finally {
+                if (!getIsCompleteEOT()) trimEOT()
             }
         }
     }
 
-    suspend fun unload() {
-        llamaAndroid.unload()
-    }
+    suspend fun unload() { llamaAndroid.unload() }
 
     var tokensList = mutableListOf<String>()
     var benchmarkStartTime: Long = 0L
@@ -396,8 +556,7 @@ class MainViewModel(
                         delay(1000L)
                         val elapsedTime = System.currentTimeMillis() - benchmarkStartTime
                         if (elapsedTime > 0) {
-                            tokensPerSecondsFinal =
-                                tokensList.size.toDouble() / (elapsedTime / 1000.0)
+                            tokensPerSecondsFinal = tokensList.size.toDouble() / (elapsedTime / 1000.0)
                         }
                     }
                 }
@@ -421,10 +580,7 @@ class MainViewModel(
 
     fun load(pathToModel: String, userThreads: Int) {
         viewModelScope.launch {
-            try {
-                llamaAndroid.unload()
-            } catch (_: Exception) {
-            }
+            try { llamaAndroid.unload() } catch (_: Exception) {}
 
             try {
                 loadedModelName.value = pathToModel.substringAfterLast('/')
@@ -466,22 +622,22 @@ class MainViewModel(
         if (messages.isEmpty()) return
         val lastMessageContent = messages.last()["content"] ?: ""
         if (lastMessageContent.length < eot_str.length) return
-
         val updatedContent = lastMessageContent.slice(0..(lastMessageContent.length - eot_str.length))
-        val updatedLastMessage = messages.last() + ("content" to updatedContent)
-        messages = messages.toMutableList().apply { set(messages.lastIndex, updatedLastMessage) }
+        val fixedLastMessage = messages.last() + ("content" to updatedContent)
+        messages = messages.toMutableList().apply { set(messages.lastIndex, fixedLastMessage) }
     }
 
-    private fun removeExtraWhiteSpaces(input: String): String =
-        input.replace("\\s+".toRegex(), " ")
+    private fun removeExtraWhiteSpaces(input: String): String = input.replace("\\s+".toRegex(), " ")
 
-    fun updateMessage(newMessage: String) {
-        message = newMessage
-    }
+    fun updateMessage(newMessage: String) { message = newMessage }
 
     fun clear() {
         messages = listOf()
         first = true
+        lastRouteWasDocs = false
+        docModeTurnsLeft = 0
+        lockedDocId = null
+        lastDocContext = null
     }
 
     fun getIsSending(): Boolean = llamaAndroid.getIsSending()

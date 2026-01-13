@@ -10,6 +10,7 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
+import kotlin.math.max
 
 // PDF (pdfbox-android)
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
@@ -83,8 +84,8 @@ object DocumentTextExtractor {
     }
 
     /**
-     * ✅ Primary API used by Worker/Repo
-     * Throws with a real reason if extraction fails.
+     * Primary API used by Worker/Repo.
+     * Throws with a real reason if extraction fails or is low-quality.
      */
     fun extractTextFromUri(
         context: Context,
@@ -93,13 +94,12 @@ object DocumentTextExtractor {
         maxChars: Int = 250_000,
     ): String {
         val resolver = context.contentResolver
-        val meta = try { queryMeta(resolver, uri) } catch (_: Throwable) {
-            Meta("document", "", 0L)
-        }
+        val meta = runCatching { queryMeta(resolver, uri) }
+            .getOrElse { Meta("document", "", 0L) }
 
         Log.d(TAG, "extractTextFromUri start name=${meta.displayName} mime=${meta.mime} uri=$uri")
 
-        val out = extractText(
+        val raw = extractText(
             context = context,
             resolver = resolver,
             uri = uri,
@@ -107,14 +107,28 @@ object DocumentTextExtractor {
             maxChars = maxChars
         )?.trim().orEmpty()
 
-        if (out.isBlank()) {
+        if (raw.isBlank()) {
+            throw IllegalStateException("Extraction returned empty. name=${meta.displayName} mime=${meta.mime} uri=$uri")
+        }
+
+        // ✅ Clean repeated header/footer noise (very common in resumes)
+        val cleaned = removeRepeatingLines(raw)
+
+        // ✅ Quality gate: prevent indexing garbage that causes repeated-name answers
+        val q = quality(cleaned)
+        if (q.tooShort) {
             throw IllegalStateException(
-                "Extraction returned empty. name=${meta.displayName} mime=${meta.mime} uri=$uri"
+                "Extraction too small (${q.chars} chars). Likely scanned/image PDF or unsupported layout. name=${meta.displayName}"
+            )
+        }
+        if (q.tooRepetitive) {
+            throw IllegalStateException(
+                "Extraction too repetitive (uniqueLineRatio=${"%.2f".format(q.uniqueLineRatio)}). Likely header-only text. name=${meta.displayName}"
             )
         }
 
-        Log.d(TAG, "extractTextFromUri OK chars=${out.length} name=${meta.displayName}")
-        return out
+        Log.d(TAG, "extractTextFromUri OK chars=${cleaned.length} name=${meta.displayName}")
+        return cleaned.take(maxChars)
     }
 
     private fun extractText(
@@ -124,11 +138,8 @@ object DocumentTextExtractor {
         maxBytes: Int,
         maxChars: Int,
     ): String? {
-        val meta = try {
-            queryMeta(resolver, uri)
-        } catch (_: Throwable) {
-            Meta(displayName = "document", mime = "", sizeBytes = 0L)
-        }
+        val meta = runCatching { queryMeta(resolver, uri) }
+            .getOrElse { Meta(displayName = "document", mime = "", sizeBytes = 0L) }
 
         val name = meta.displayName
         val mime = meta.mime
@@ -146,7 +157,7 @@ object DocumentTextExtractor {
             }
 
             mime == "application/pdf" || lower.endsWith(".pdf") -> {
-                try { ensurePdfBoxInit(context) } catch (_: Throwable) {}
+                runCatching { ensurePdfBoxInit(context) }
                 openInputStreamCompat(context, uri)?.use { input ->
                     extractPdf(BufferedInputStream(input), maxChars)
                 }
@@ -192,6 +203,7 @@ object DocumentTextExtractor {
         return try {
             PDDocument.load(input).use { doc ->
                 val stripper = PDFTextStripper()
+                stripper.sortByPosition = true
                 stripper.getText(doc).orEmpty().trim().take(maxChars)
             }
         } catch (t: Throwable) {
@@ -214,7 +226,7 @@ object DocumentTextExtractor {
                 }
                 sb.toString().trim().take(maxChars)
             } finally {
-                try { doc.close() } catch (_: Throwable) {}
+                runCatching { doc.close() }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "DOCX extraction failed", t)
@@ -260,12 +272,77 @@ object DocumentTextExtractor {
 
                 sb.toString().trim().take(maxChars)
             } finally {
-                try { wb.close() } catch (_: Throwable) {}
+                runCatching { wb.close() }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "XLSX extraction failed", t)
             null
         }
+    }
+
+    // ---------------------------
+    // ✅ Noise cleanup & quality
+    // ---------------------------
+
+    private data class Quality(
+        val chars: Int,
+        val lines: Int,
+        val uniqueLines: Int,
+        val uniqueLineRatio: Double,
+        val tooShort: Boolean,
+        val tooRepetitive: Boolean
+    )
+
+    private fun quality(text: String): Quality {
+        val lines = text.lines().map { it.trim() }.filter { it.isNotBlank() }
+        val unique = lines.map { it.lowercase().replace(Regex("\\s+"), " ") }.toSet()
+        val ratio = if (lines.isEmpty()) 0.0 else unique.size.toDouble() / lines.size.toDouble()
+
+        val chars = text.length
+        val tooShort = chars < 350 // resumes should be larger than this if extraction succeeded
+        val tooRepetitive = lines.size >= 10 && ratio < 0.35
+
+        return Quality(
+            chars = chars,
+            lines = lines.size,
+            uniqueLines = unique.size,
+            uniqueLineRatio = ratio,
+            tooShort = tooShort,
+            tooRepetitive = tooRepetitive
+        )
+    }
+
+    /**
+     * Removes repeated short lines (headers/footers) that appear many times.
+     * This fixes "Name Name Name" chunk domination.
+     */
+    private fun removeRepeatingLines(text: String): String {
+        val lines = text.lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
+        if (lines.size < 12) return text
+
+        val freq = HashMap<String, Int>()
+        for (l in lines) {
+            val key = l.lowercase().replace(Regex("\\s+"), " ")
+            freq[key] = (freq[key] ?: 0) + 1
+        }
+
+        val filtered = lines.filter { l ->
+            val key = l.lowercase().replace(Regex("\\s+"), " ")
+            val count = freq[key] ?: 0
+
+            // drop repeated short lines (headers like candidate name, title, phone)
+            val isShort = key.length <= 60
+            val isRepeated = count >= 3
+
+            !(isShort && isRepeated)
+        }
+
+        // If filtering removed too much, keep original
+        val out = filtered.joinToString("\n")
+        return if (out.length >= max(120, text.length / 4)) out else text
     }
 }
 

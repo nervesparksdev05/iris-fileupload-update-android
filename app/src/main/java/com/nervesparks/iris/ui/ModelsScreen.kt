@@ -25,23 +25,31 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nervesparks.iris.MainViewModel
 import com.nervesparks.iris.R
+import com.nervesparks.iris.ui.components.EmbeddingModelCard
 import com.nervesparks.iris.ui.components.LoadingModal
 import com.nervesparks.iris.ui.components.ModelCard
 import java.io.File
 
 @Composable
-fun ModelsScreen(extFileDir: File?, viewModel: MainViewModel, onSearchResultButtonClick: () -> Unit, dm: DownloadManager) {
+fun ModelsScreen(
+    extFileDir: File?,
+    viewModel: MainViewModel,
+    onSearchResultButtonClick: () -> Unit,
+    dm: DownloadManager
+) {
     // Observe viewModel.refresh to trigger recomposition
     val refresh = viewModel.refresh
+    if (refresh) viewModel.refresh = false
 
-    // Reset refresh to false after the screen is recomposed
-    if (refresh) {
-        viewModel.refresh = false
-    }
+    // ✅ Filter embedding models OUT of allModels so ModelCard never gets an embedding model
+    val embeddingNames: Set<String> =
+        viewModel.embeddingModels.mapNotNull { it["name"]?.toString() }.toSet()
+
+    val chatModelsOnly =
+        viewModel.allModels.filter { it["name"]?.toString() !in embeddingNames }
 
     Box {
         if (viewModel.showAlert) {
-            // Modal dialog to show download options
             LoadingModal(viewModel)
         }
 
@@ -53,12 +61,10 @@ fun ModelsScreen(extFileDir: File?, viewModel: MainViewModel, onSearchResultButt
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 10.dp, vertical = 5.dp)
-                            .clickable {
-                                onSearchResultButtonClick()
-                            }
+                            .clickable { onSearchResultButtonClick() }
                     ) {
                         Icon(
-                            modifier = Modifier.size(20.dp), // Icon size
+                            modifier = Modifier.size(20.dp),
                             painter = painterResource(id = R.drawable.search_svgrepo_com__3_),
                             contentDescription = "Parameters",
                             tint = Color.White
@@ -68,8 +74,7 @@ fun ModelsScreen(extFileDir: File?, viewModel: MainViewModel, onSearchResultButt
                             text = "Search Hugging-Face Models",
                             color = Color.White,
                             fontSize = 18.sp,
-                            modifier = Modifier
-                                .padding(vertical = 12.dp, horizontal = 7.dp)
+                            modifier = Modifier.padding(vertical = 12.dp, horizontal = 7.dp)
                         )
                         Spacer(Modifier.weight(1f))
                         Icon(
@@ -79,59 +84,72 @@ fun ModelsScreen(extFileDir: File?, viewModel: MainViewModel, onSearchResultButt
                             tint = Color.White,
                         )
                     }
+
                     Divider(
-                        modifier = Modifier
-                            .fillMaxWidth(),
-                        color = Color.DarkGray, // Set the color of the divider
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color.DarkGray,
                         thickness = 1.dp
                     )
                     Spacer(Modifier.height(25.dp))
-                    // Suggested Models Section
+
+                    // 🧠 Embedding Models Section
                     Text(
-                        text = "Suggested Models",
+                        text = "Embedding Models",
                         color = Color.White.copy(alpha = .5f),
                         modifier = Modifier.padding(5.dp),
                         fontSize = 18.sp
                     )
+                    Text(
+                        text = "Required for document processing & RAG",
+                        color = Color.White.copy(alpha = .3f),
+                        modifier = Modifier.padding(start = 5.dp, bottom = 8.dp),
+                        fontSize = 12.sp
+                    )
                 }
             }
 
-            // Show first three suggested models
-            items(viewModel.allModels.take(3)) { model ->
+            // Embedding models (Download + Delete happens ONLY here)
+            items(viewModel.embeddingModels) { model ->
                 extFileDir?.let {
                     model["source"]?.let { source ->
-                        ModelCard(
-                            model["name"].toString(),
+                        EmbeddingModelCard(
+                            modelName = model["name"].toString(),
+                            modelSize = model["size"] ?: "~25MB",
+                            modelDescription = model["description"] ?: "",
                             viewModel = viewModel,
                             dm = dm,
                             extFilesDir = extFileDir,
-                            downloadLink = source,
-                            showDeleteButton = true
+                            downloadLink = source
                         )
                     }
                 }
             }
-            item {
-                Divider(
-                    modifier = Modifier
-                        .fillMaxWidth(),
-                    color = Color.DarkGray, // Set the color of the divider
-                    thickness = 1.dp
-                )
-            }
 
             item {
-                // My Models Section
+                Spacer(Modifier.height(15.dp))
+                Divider(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color.DarkGray,
+                    thickness = 1.dp
+                )
+                Spacer(Modifier.height(25.dp))
+
                 Text(
-                    text = "My Models",
+                    text = "Suggested Models",
                     color = Color.White.copy(alpha = .5f),
                     modifier = Modifier.padding(5.dp),
                     fontSize = 18.sp
                 )
+                Text(
+                    text = "Chat/Language models for conversations",
+                    color = Color.White.copy(alpha = .3f),
+                    modifier = Modifier.padding(start = 5.dp, bottom = 8.dp),
+                    fontSize = 12.sp
+                )
             }
 
-            // Display all models not in Suggested Models
-            items(viewModel.allModels.drop(3)) { model ->
+            // ✅ Use chatModelsOnly here (not viewModel.allModels)
+            items(chatModelsOnly.take(3)) { model ->
                 extFileDir?.let {
                     model["source"]?.let { source ->
                         ModelCard(
@@ -145,13 +163,28 @@ fun ModelsScreen(extFileDir: File?, viewModel: MainViewModel, onSearchResultButt
                     }
                 }
             }
+
             item {
-                if (viewModel.allModels.drop(3).isEmpty()) {
-                    Text(
-                        text = "No models to show",
-                        color = Color.White,
-                        modifier = Modifier.padding(top = 8.dp, start = 2.dp)
-                    )
+                Divider(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color.DarkGray,
+                    thickness = 1.dp
+                )
+            }
+
+            // ✅ Use chatModelsOnly here too
+            items(chatModelsOnly.drop(3)) { model ->
+                extFileDir?.let {
+                    model["source"]?.let { source ->
+                        ModelCard(
+                            model["name"].toString(),
+                            viewModel = viewModel,
+                            dm = dm,
+                            extFilesDir = extFileDir,
+                            downloadLink = source,
+                            showDeleteButton = true
+                        )
+                    }
                 }
             }
         }

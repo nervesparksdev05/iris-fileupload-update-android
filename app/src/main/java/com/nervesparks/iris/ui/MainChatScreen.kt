@@ -177,7 +177,7 @@ fun MainChatScreen(
     // ✅ Use indexed docs (Room-backed) instead of old userDocs list
     val docs = viewModel.indexedDocs.value
     val docCount = docs.size
-    val maxDocs = 10
+    val maxDocs = 3
 
     // ✅ NEW: what we show as bottom “file chips” (like your screenshot)
     var pendingAttachments by remember { mutableStateOf<List<PendingAttachment>>(emptyList()) }
@@ -670,11 +670,27 @@ fun MainChatScreen(
                             )
 
                             if (!viewModel.getIsSending()) {
+
                                 IconButton(onClick = {
                                     if (viewModel.loadedModelName.value == "") {
                                         focusManager.clearFocus()
                                         Toast.makeText(context, "Load A Model First", Toast.LENGTH_SHORT).show()
                                     } else {
+                                        // If user refers to "the file / this PDF" and there are pending attachments,
+                                        // add a lightweight hint so RAG can target the right document.
+                                        val current = viewModel.message
+                                        val refersToFile = current.contains("file", true) ||
+                                                current.contains("document", true) ||
+                                                current.contains("pdf", true) ||
+                                                current.contains("this", true)
+
+                                        if (refersToFile && pendingAttachments.isNotEmpty()) {
+                                            val names = pendingAttachments.take(3).joinToString { it.name }
+                                            if (names.isNotBlank() && !current.contains(names, ignoreCase = true)) {
+                                                viewModel.updateMessage("$current (about uploaded document(s): $names)")
+                                            }
+                                        }
+
                                         viewModel.send()
                                         focusManager.clearFocus()
                                     }
