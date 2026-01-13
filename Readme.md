@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Iris - Offline AI Chat for Android
 
 <div align="center">
@@ -31,10 +30,7 @@
 - [Adding Custom Models](#adding-custom-models)
 - [Configuration](#configuration)
 - [Technical Details](#technical-details)
-- [Contributing](#contributing)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
-- [Contact](#contact)
+
 
 ---
 
@@ -108,11 +104,11 @@
 
 ## 📱 Screenshots
 
-![WhatsApp Image 2026-01-13 at 5.29.56 PM.jpeg](../../../Pictures/nervesparks/WhatsApp%20Image%202026-01-13%20at%205.29.56%20PM.jpeg)
-![WhatsApp Image 2026-01-13 at 5.29.57 PM (1).jpeg](../../../Pictures/nervesparks/WhatsApp%20Image%202026-01-13%20at%205.29.57%20PM%20%281%29.jpeg)
-![WhatsApp Image 2026-01-13 at 5.29.57 PM.jpeg](../../../Pictures/nervesparks/WhatsApp%20Image%202026-01-13%20at%205.29.57%20PM.jpeg)
-![WhatsApp Image 2026-01-13 at 5.29.58 PM (1).jpeg](../../../Pictures/nervesparks/WhatsApp%20Image%202026-01-13%20at%205.29.58%20PM%20%281%29.jpeg)
-![WhatsApp Image 2026-01-13 at 5.29.58 PM.jpeg](../../../Pictures/nervesparks/WhatsApp%20Image%202026-01-13%20at%205.29.58%20PM.jpeg)
+![WhatsApp Image 2026-01-13 at 5.29.56 PM.jpeg](images/WhatsApp%20Image%202026-01-13%20at%205.29.56%20PM.jpeg)
+![WhatsApp Image 2026-01-13 at 5.29.57 PM.jpeg](images/WhatsApp%20Image%202026-01-13%20at%205.29.57%20PM.jpeg)
+![WhatsApp Image 2026-01-13 at 5.29.57 PM (1).jpeg](images/WhatsApp%20Image%202026-01-13%20at%205.29.57%20PM%20%281%29.jpeg)
+![WhatsApp Image 2026-01-13 at 5.29.58 PM.jpeg](images/WhatsApp%20Image%202026-01-13%20at%205.29.58%20PM.jpeg)
+![WhatsApp Image 2026-01-13 at 5.29.58 PM (1).jpeg](images/WhatsApp%20Image%202026-01-13%20at%205.29.58%20PM%20%281%29.jpeg)
 
 ---
 
