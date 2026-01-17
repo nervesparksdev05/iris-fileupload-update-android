@@ -46,7 +46,7 @@ class RagRepository(
 
     fun snapshotDocs(): List<LocalDoc> = store.readAllDocs()
 
-    fun fallbackTopChunksForDoc(docId: String, maxChunks: Int = 8): List<RetrievalHit> {
+    fun fallbackTopChunksForDoc(docId: String, maxChunks: Int = 12): List<RetrievalHit> {
         if (maxChunks <= 0) return emptyList()
         val doc = store.readAllDocs().firstOrNull { it.docId == docId } ?: return emptyList()
         val chunks = store.readDocChunks(docId, maxChunks).sortedBy { it.chunkIndex }
@@ -132,7 +132,7 @@ class RagRepository(
         val embLastMod: Long
     )
 
-    private val cache = LinkedHashMap<String, CachedDoc>(8, 0.75f, true)
+    private val cache = LinkedHashMap<String, CachedDoc>(16, 0.75f, true)
 
     private fun invalidateCache(docId: String) {
         synchronized(cache) { cache.remove(docId) }
@@ -193,7 +193,7 @@ class RagRepository(
 
         synchronized(cache) {
             cache[doc.docId] = cd
-            while (cache.size > 8) {
+            while (cache.size > 16) {
                 val it = cache.entries.iterator()
                 if (it.hasNext()) {
                     it.next()
@@ -207,18 +207,22 @@ class RagRepository(
 
     /**
      * ✅ Retrieval can be restricted to ONE doc using docIdFilter.
+     * ✅ IMPROVED: Lower threshold, dynamic cutoff, better logging
      */
     suspend fun retrieve(
         query: String,
-        topK: Int = 5,
-        scoreThreshold: Double = 0.10,
+        topK: Int = 8,
+        scoreThreshold: Double = 0.05,
         docIdFilter: String? = null
     ): List<RetrievalHit> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
 
         val qEmb = embedder.embed(q)
-        if (qEmb.isEmpty()) return emptyList()
+        if (qEmb.isEmpty()) {
+            Log.w(TAG, "retrieve: embedder returned empty vector for query")
+            return emptyList()
+        }
 
         val readyDocs = store.readAllDocs()
             .filter { it.status == "READY" }
@@ -227,10 +231,14 @@ class RagRepository(
                 else docs.filter { it.docId == docIdFilter }
             }
 
-        if (readyDocs.isEmpty()) return emptyList()
+        if (readyDocs.isEmpty()) {
+            Log.d(TAG, "retrieve: no ready docs available")
+            return emptyList()
+        }
 
         val k = topK.coerceAtLeast(1)
         val heap = PriorityQueue<RetrievalHit>(k) { a, b -> a.score.compareTo(b.score) }
+        var bestScoreFound = 0.0
 
         for (doc in readyDocs) {
             val cached = loadDocIntoCache(doc, expectedDim = qEmb.size) ?: continue
@@ -240,6 +248,9 @@ class RagRepository(
             val nChunks = min(cached.chunks.size, cached.embeddings.size / bytesPer)
             for (i in 0 until nChunks) {
                 val score = VectorSearch.dotPackedLE(qEmb, cached.embeddings, i * bytesPer, dim)
+                if (score > bestScoreFound) bestScoreFound = score
+                
+                // Use static threshold for initial filtering
                 if (score <= scoreThreshold) continue
 
                 val chunk = cached.chunks[i]
@@ -260,16 +271,24 @@ class RagRepository(
             }
         }
 
+        // Apply dynamic threshold: if best score is high, filter out low relative scores
+        val dynamicThreshold = if (bestScoreFound > 0.5) bestScoreFound * 0.25 else scoreThreshold
+        
         val out = ArrayList<RetrievalHit>(heap.size)
-        while (heap.isNotEmpty()) out.add(heap.poll())
+        while (heap.isNotEmpty()) {
+            val hit = heap.poll()
+            if (hit.score >= dynamicThreshold) out.add(hit)
+        }
         out.sortByDescending { it.score }
+        
+        Log.i(TAG, "retrieve: query='${q.take(50)}...' hits=${out.size} bestScore=${"%0.3f".format(bestScoreFound)} threshold=${"%0.3f".format(dynamicThreshold)}")
         return out
     }
 
     /**
-     * Lightweight context block for model.
+     * ✅ IMPROVED: Larger context block for more comprehensive model responses.
      */
-    fun buildContextBlock(hits: List<RetrievalHit>, maxChars: Int = 1200): String? {
+    fun buildContextBlock(hits: List<RetrievalHit>, maxChars: Int = 2400): String? {
         if (hits.isEmpty()) return null
 
         val uniq = hits.distinctBy { "${it.docId}:${it.chunkId}:${it.chunkIndex}" }
@@ -278,24 +297,24 @@ class RagRepository(
         val sb = StringBuilder()
         sb.appendLine(
             """
-DOCUMENT CONTEXT (excerpts):
-Use excerpts for factual claims. If missing, say "Not found in the document context."
-When citing, mention: [DocName §ChunkNumber].
+DOCUMENT CONTEXT (excerpts from uploaded documents):
+Use these excerpts to answer questions. Cite sources as [DocName §ChunkNumber].
+If the answer is not in these excerpts, say "I cannot find this information in the uploaded documents."
 
 """.trimIndent()
         )
 
-        var remaining = maxChars.coerceAtLeast(400)
+        var remaining = maxChars.coerceAtLeast(600)
         for ((docName, docHits) in hitsByDoc) {
             if (remaining <= 0) break
             sb.appendLine("### $docName")
-            for (h in docHits.sortedByDescending { it.score }.take(6)) {
+            for (h in docHits.sortedByDescending { it.score }.take(8)) {
                 val text = h.text.trim()
                 if (text.isEmpty()) continue
 
                 val block = "\n[${docName} §${h.chunkIndex + 1}] $text\n"
                 if (block.length > remaining) {
-                    val take = remaining.coerceAtLeast(80)
+                    val take = remaining.coerceAtLeast(100)
                     sb.appendLine(block.take(take) + "\n…")
                     remaining = 0
                     break
@@ -307,6 +326,7 @@ When citing, mention: [DocName §ChunkNumber].
             sb.appendLine()
         }
 
+        Log.d(TAG, "buildContextBlock: ${uniq.size} unique hits, output ${sb.length} chars")
         return sb.toString().trim()
     }
 

@@ -152,16 +152,11 @@ class MainViewModel(
             val strictRule = mapOf(
                 "role" to "system",
                 "content" to """
-DOCUMENT MODE ACTIVE: You have access to uploaded documents.
+DOCUMENT MODE: You have uploaded documents but no relevant excerpts were found for this question.
 
-CRITICAL RULES - YOU MUST FOLLOW THESE:
-1. You can ONLY answer questions using information from the uploaded documents
-2. If the answer is NOT in the documents, you MUST respond with: "I cannot find this information in the uploaded documents."
-3. NEVER use your general knowledge or training data
-4. NEVER make up, guess, or invent information
-5. Always cite your source like this: [Document Name §Section]
+You MUST respond with: "I cannot find this information in the uploaded documents. Please try rephrasing your question or ask about a different topic from the document."
 
-STATUS: No relevant excerpts found for this specific question. You must say you cannot find the information.
+Do NOT use your general knowledge. Only answer from documents.
 """.trimIndent()
             )
 
@@ -173,24 +168,19 @@ STATUS: No relevant excerpts found for this specific question. You must say you 
             }
         }
 
-        // ✅ When excerpts are available, provide them with very strict instructions
+        // ✅ When excerpts are available, provide them with clear instructions
         val strictRule = mapOf(
             "role" to "system",
             "content" to """
-DOCUMENT MODE ACTIVE: Answer ONLY using the document excerpts provided below.
+DOCUMENT MODE: Answer ONLY from the document excerpts below.
 
-CRITICAL RULES - YOU MUST FOLLOW THESE:
-1. Use ONLY the information from the excerpts below
-2. If the answer is NOT in the excerpts, say: "I cannot find this information in the uploaded documents."
-3. NEVER use your general knowledge or training data
-4. NEVER make up, guess, or invent information
-5. Always cite your source like this: [Document Name §Section]
-6. Do NOT repeat or paste large portions of the excerpts unless specifically asked
+RULES:
+1. Use ONLY information from the excerpts
+2. If not found in excerpts, say: "I cannot find this in the documents."
+3. Cite sources as [DocName §Section]
+4. Do NOT use general knowledge
 
-DOCUMENT EXCERPTS:
 $docExcerpts
-
-REMINDER: Answer ONLY from the excerpts above. If the information is not there, say so explicitly.
 """.trimIndent()
         )
 
@@ -440,8 +430,8 @@ REMINDER: Answer ONLY from the excerpts above. If the information is not there, 
                 if (readyDocs.isEmpty()) emptyList()
                 else ragRepo.retrieve(
                     query = retrievalQuery,
-                    topK = 5,  // ✅ Increased from 2-3 to get more context
-                    scoreThreshold = 0.08,  // ✅ Lowered threshold to be more permissive
+                    topK = 8,  // ✅ Increased for more context variety
+                    scoreThreshold = 0.05,  // ✅ Lowered for better recall
                     docIdFilter = docFilter
                 )
             }
@@ -477,19 +467,19 @@ REMINDER: Answer ONLY from the excerpts above. If the information is not there, 
                 "route: useDocs=$useDocs reason=$reason ready=${readyDocs.size} hits=${hits.size} best=$best second=$second lockedDocId=$lockedDocId"
             )
 
-            // ✅ Build context with fallback options
+            // ✅ Build context with fallback options - IMPROVED sizes
             val docExcerpts: String? = when {
                 useDocs && hits.isNotEmpty() -> {
-                    // Has good retrieval hits
-                    ragRepo.buildContextBlock(hits, maxChars = 1200)
+                    // Has good retrieval hits - use larger context
+                    ragRepo.buildContextBlock(hits, maxChars = 2400)
                         .also { lastDocContext = it }
                 }
                 useDocs && lockedDocId != null -> {
-                    // No hits but we have a locked doc - get top chunks
+                    // No hits but we have a locked doc - get more chunks for better coverage
                     val fallback = withContext(Dispatchers.IO) {
-                        ragRepo.fallbackTopChunksForDoc(lockedDocId!!, maxChunks = 6)
+                        ragRepo.fallbackTopChunksForDoc(lockedDocId!!, maxChunks = 12)
                     }
-                    ragRepo.buildContextBlock(fallback, maxChars = 900)
+                    ragRepo.buildContextBlock(fallback, maxChars = 2000)
                         .also { lastDocContext = it }
                 }
                 useDocs -> {

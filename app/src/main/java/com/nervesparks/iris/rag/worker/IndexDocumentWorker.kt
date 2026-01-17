@@ -87,8 +87,8 @@ class IndexDocumentWorker(
 
             val chunks = Chunker.chunkText(
                 normalized,
-                targetChars = 900,
-                overlapChars = 250
+                targetChars = 700,   // ✅ Reduced from 900 for finer-grained retrieval
+                overlapChars = 300   // ✅ Increased from 250 for better context continuity
             )
 
             if (chunks.isEmpty()) {

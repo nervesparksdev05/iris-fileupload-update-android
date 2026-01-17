@@ -19,6 +19,13 @@ class LlamaCppEmbedder(
     @Volatile
     private var loaded = false
 
+    // ✅ LRU cache for query embeddings - major performance boost for repeated queries
+    private val embeddingCache = object : LinkedHashMap<String, FloatArray>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, FloatArray>?): Boolean {
+            return size > 64  // Keep last 64 unique queries
+        }
+    }
+
     private fun ensureLoaded() {
         if (loaded) return
         synchronized(this) {
@@ -64,8 +71,18 @@ class LlamaCppEmbedder(
         val q = text.trim()
         if (q.isEmpty()) return FloatArray(0)
 
+        // ✅ Check cache first - avoid expensive embedding computation
+        val cacheKey = q.lowercase().take(256)  // Normalize and limit key size
+        synchronized(embeddingCache) {
+            embeddingCache[cacheKey]?.let { cached ->
+                Log.d(TAG, "embed: cache HIT for query")
+                return cached.copyOf()  // Return copy to prevent mutation
+            }
+        }
+
         ensureLoaded()
 
+        val startTime = System.currentTimeMillis()
         val vec = runBlocking {
             try {
                 llama.embed(q)
@@ -75,8 +92,15 @@ class LlamaCppEmbedder(
             }
         }
 
-        if (!normalize || vec.isEmpty()) return vec
-        return l2NormalizeInPlace(vec)
+        val result = if (!normalize || vec.isEmpty()) vec else l2NormalizeInPlace(vec)
+        
+        // ✅ Cache the result
+        synchronized(embeddingCache) {
+            embeddingCache[cacheKey] = result.copyOf()
+        }
+        
+        Log.d(TAG, "embed: computed in ${System.currentTimeMillis() - startTime}ms, cached")
+        return result
     }
 
     private fun l2NormalizeInPlace(x: FloatArray): FloatArray {
@@ -85,6 +109,10 @@ class LlamaCppEmbedder(
         val denom = sqrt(sum).toFloat().coerceAtLeast(1e-12f)
         for (i in x.indices) x[i] /= denom
         return x
+    }
+
+    fun clearCache() {
+        synchronized(embeddingCache) { embeddingCache.clear() }
     }
 
     companion object {
