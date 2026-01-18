@@ -136,60 +136,58 @@ class MainViewModel(
     }
 
     /**
-     * ✅ IMPROVED: Strict document-only mode with clear instructions for all models
-     * When documents are uploaded, the model can ONLY answer from documents.
+     * ✅ IMPROVED: Inject document context DIRECTLY into user message
+     * Small models often ignore system instructions, so we put the context
+     * right in front of the user's question where it can't be ignored.
      */
     private fun injectDocContextTransient(
         msgs: List<Map<String, String>>,
         docExcerpts: String?,
         hasReadyDocs: Boolean
     ): List<Map<String, String>> {
-        // ✅ If no documents are ready, return normal conversation
+        // If no documents are ready, return normal conversation
         if (!hasReadyDocs) return msgs
 
-        // ✅ If documents exist but no excerpts retrieved, force document-only mode
+        val mutableMsgs = msgs.toMutableList()
+        
+        // Find the last user message
+        val lastUserIdx = mutableMsgs.indexOfLast { it["role"] == "user" }
+        if (lastUserIdx < 0) return msgs
+
+        val originalQuestion = mutableMsgs[lastUserIdx]["content"] ?: return msgs
+
+        // If documents exist but no excerpts retrieved
         if (docExcerpts.isNullOrBlank()) {
-            val strictRule = mapOf(
-                "role" to "system",
+            val modifiedUserMsg = mapOf(
+                "role" to "user",
                 "content" to """
-DOCUMENT MODE: You have uploaded documents but no relevant excerpts were found for this question.
+[DOCUMENT CONTEXT: I have uploaded documents but no relevant excerpts were found for this question.]
 
-You MUST respond with: "I cannot find this information in the uploaded documents. Please try rephrasing your question or ask about a different topic from the document."
+My question: $originalQuestion
 
-Do NOT use your general knowledge. Only answer from documents.
+IMPORTANT: If you cannot find the answer in the provided document excerpts, say "I cannot find this information in the uploaded documents."
 """.trimIndent()
             )
-
-            val sysIdx = msgs.indexOfFirst { it["role"] == "system" }
-            return if (sysIdx >= 0) {
-                msgs.toMutableList().apply { add(sysIdx + 1, strictRule) }
-            } else {
-                listOf(strictRule) + msgs
-            }
+            mutableMsgs[lastUserIdx] = modifiedUserMsg
+            return mutableMsgs
         }
 
-        // ✅ When excerpts are available, provide them with clear instructions
-        val strictRule = mapOf(
-            "role" to "system",
+        // When excerpts are available, inject them right before the question
+        val modifiedUserMsg = mapOf(
+            "role" to "user",
             "content" to """
-DOCUMENT MODE: Answer ONLY from the document excerpts below.
-
-RULES:
-1. Use ONLY information from the excerpts
-2. If not found in excerpts, say: "I cannot find this in the documents."
-3. Cite sources as [DocName §Section]
-4. Do NOT use general knowledge
-
+=== DOCUMENT EXCERPTS (from my uploaded files) ===
 $docExcerpts
+=== END OF DOCUMENT EXCERPTS ===
+
+Based ONLY on the document excerpts above, please answer this question:
+$originalQuestion
+
+REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [DocName §Section]. If the answer is not in the excerpts, say "I cannot find this in the uploaded documents."
 """.trimIndent()
         )
-
-        val sysIdx = msgs.indexOfFirst { it["role"] == "system" }
-        return if (sysIdx >= 0) {
-            msgs.toMutableList().apply { add(sysIdx + 1, strictRule) }
-        } else {
-            listOf(strictRule) + msgs
-        }
+        mutableMsgs[lastUserIdx] = modifiedUserMsg
+        return mutableMsgs
     }
 
     // -----------------------------
@@ -398,22 +396,22 @@ $docExcerpts
         viewModelScope.launch {
             val docsSnapshot = withContext(Dispatchers.IO) { ragRepo.snapshotDocs() }
             val readyDocs = docsSnapshot.filter { it.status.equals("READY", ignoreCase = true) }
+            val hasReadyDocs = readyDocs.isNotEmpty()
 
+            // ✅ Log document status
+            Log.i(TAG, "send: docsSnapshot=${docsSnapshot.size} readyDocs=${readyDocs.size} hasReadyDocs=$hasReadyDocs")
+
+            // ✅ Check if user is explicitly asking about documents (for better error messages)
             val explicitFileAsk =
                 userMessage.contains("file", true) ||
                         userMessage.contains("document", true) ||
-                        userMessage.contains("doc", true) ||  // ✅ Added 'doc' abbreviation
+                        userMessage.contains("doc", true) ||
                         userMessage.contains("pdf", true) ||
                         userMessage.contains("resume", true) ||
                         userMessage.contains("uploaded", true)
 
-            // ✅ Add detailed logging for debugging
-            Log.i(TAG, "send: docsSnapshot=${docsSnapshot.size} readyDocs=${readyDocs.size} explicitFileAsk=$explicitFileAsk")
-            docsSnapshot.forEach { doc ->
-                Log.d(TAG, "  doc: name=${doc.name} status=${doc.status} docId=${doc.docId}")
-            }
-
-            if (explicitFileAsk && readyDocs.isEmpty()) {
+            // ✅ If user asks about docs but nothing is ready, give helpful message
+            if (explicitFileAsk && !hasReadyDocs) {
                 val indexing = docsSnapshot.any { it.status.equals("INDEXING", ignoreCase = true) }
                 val failed = docsSnapshot.any { it.status.equals("FAILED", ignoreCase = true) }
                 addMessage(
@@ -427,50 +425,38 @@ $docExcerpts
                 return@launch
             }
 
+            // ✅ ALWAYS lock to first ready doc when documents are uploaded
             val preferredDoc = readyDocs.maxByOrNull { it.createdAt }
-
-            // If user explicitly asks about docs, lock to latest READY doc immediately
-            if (explicitFileAsk && lockedDocId == null) {
+            if (hasReadyDocs && lockedDocId == null) {
                 lockedDocId = preferredDoc?.docId
             }
 
-            val retrievalQuery = userMessage
-
-            // ✅ restrict retrieval to locked doc during doc-mode followups
-            val docFilter = if (docModeTurnsLeft > 0 || explicitFileAsk) lockedDocId else null
-
-            val hits = withContext(Dispatchers.IO) {
-                if (readyDocs.isEmpty()) emptyList()
-                else ragRepo.retrieve(
-                    query = retrievalQuery,
-                    topK = 8,  // ✅ Increased for more context variety
-                    scoreThreshold = 0.05,  // ✅ Lowered for better recall
-                    docIdFilter = docFilter
-                )
+            // ✅ ALWAYS do retrieval when documents are ready
+            val hits = if (hasReadyDocs) {
+                withContext(Dispatchers.IO) {
+                    ragRepo.retrieve(
+                        query = userMessage,
+                        topK = 8,
+                        scoreThreshold = 0.05,
+                        docIdFilter = lockedDocId  // Always filter to locked doc
+                    )
+                }
+            } else {
+                emptyList()
             }
 
             val best = hits.firstOrNull()?.score ?: 0.0
             val second = hits.getOrNull(1)?.score ?: 0.0
 
-            // ✅ Use improved router - always true when docs exist
-            val (useDocs, reason) = shouldUseDocs(
-                userMessage = userMessage,
-                readyDocsCount = readyDocs.size,
-                bestScore = best,
-                secondScore = second,
-                hitsCount = hits.size,
-                lastWasDocs = lastRouteWasDocs
-            )
+            // ✅ SIMPLIFIED: Always use docs when documents are ready
+            val useDocs = hasReadyDocs
+            val reason = if (hasReadyDocs) "documents_ready" else "no_docs"
+            
+            Log.i(TAG, "route: useDocs=$useDocs reason=$reason hits=${hits.size} best=$best")
 
-            // Update tracking (kept for potential future use)
+            // ✅ Keep doc mode active while documents are present
             lastRouteWasDocs = useDocs
-            if (useDocs) {
-                docModeTurnsLeft = 2
-                if (lockedDocId == null) {
-                    lockedDocId = preferredDoc?.docId ?: hits.firstOrNull()?.docId
-                }
-            } else {
-                docModeTurnsLeft = 0
+            if (!useDocs) {
                 lockedDocId = null
                 lastDocContext = null
             }
