@@ -183,7 +183,11 @@ $docExcerpts
 Based ONLY on the document excerpts above, please answer this question:
 $originalQuestion
 
-REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [DocName §Section]. If the answer is not in the excerpts, say "I cannot find this in the uploaded documents."
+RULES:
+1. Use ONLY the information from the excerpts above.
+2. If the answer is not in the excerpts, say "I cannot find this in the uploaded documents."
+3. Do NOT repeat the excerpts word-for-word. Summarize and synthesize the answer.
+4. Be concise and direct.
 """.trimIndent()
         )
         mutableMsgs[lastUserIdx] = modifiedUserMsg
@@ -245,6 +249,21 @@ REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [Doc
     var allModels by mutableStateOf(
         listOf(
             mapOf(
+                "name" to "Phi-3-mini-4k-instruct-q4.gguf",
+                "source" to "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf?download=true",
+                "destination" to "Phi-3-mini-4k-instruct-q4.gguf"
+            ),
+            mapOf(
+                "name" to "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+                "source" to "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true",
+                "destination" to "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+            ),
+            mapOf(
+                "name" to "gemma-2-2b-it-Q4_K_M.gguf",
+                "source" to "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf?download=true",
+                "destination" to "gemma-2-2b-it-Q4_K_M.gguf"
+            ),
+            mapOf(
                 "name" to "Llama-3.2-1B-Instruct-Q6_K_L.gguf",
                 "source" to "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K_L.gguf?download=true",
                 "destination" to "Llama-3.2-1B-Instruct-Q6_K_L.gguf"
@@ -255,9 +274,9 @@ REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [Doc
                 "destination" to "Llama-3.2-3B-Instruct-Q4_K_L.gguf"
             ),
             mapOf(
-                "name" to "stablelm-2-1_6b-chat.Q4_K_M.imx.gguf",
-                "source" to "https://huggingface.co/Crataco/stablelm-2-1_6b-chat-imatrix-GGUF/resolve/main/stablelm-2-1_6b-chat.Q4_K_M.imx.gguf?download=true",
-                "destination" to "stablelm-2-1_6b-chat.Q4_K_M.imx.gguf"
+                "name" to "TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf",
+                "source" to "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf?download=true",
+                "destination" to "TinyLlama-1.1B-Chat-v1.0.Q4_K_M.gguf"
             )
         )
     )
@@ -269,7 +288,14 @@ REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [Doc
                 "source" to "https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/resolve/main/bge-small-en-v1.5-q4_k_m.gguf",
                 "destination" to "bge-small-en-v1.5-q4_k_m.gguf",
                 "size" to "~25MB",
-                "description" to "Required for document indexing & search"
+                "description" to "Recommended: High accuracy"
+            ),
+            mapOf(
+                "name" to "all-MiniLM-L6-v2-Q4_K_M.gguf",
+                "source" to "https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-Q4_K_M.gguf?download=true",
+                "destination" to "all-MiniLM-L6-v2-Q4_K_M.gguf",
+                "size" to "~15MB",
+                "description" to "Faster: Good for old devices"
             )
         )
     )
@@ -448,16 +474,25 @@ REMEMBER: Use ONLY the information from the excerpts above. Cite sources as [Doc
             val best = hits.firstOrNull()?.score ?: 0.0
             val second = hits.getOrNull(1)?.score ?: 0.0
 
-            // ✅ SIMPLIFIED: Always use docs when documents are ready
-            val useDocs = hasReadyDocs
-            val reason = if (hasReadyDocs) "documents_ready" else "no_docs"
+            // ✅ SMART ROUTING: Only use docs if query matches well OR user explicitly asks
+            // Threshold 0.35 ensures we don't inject random context for "Hi how are you"
+            val useDocs = hasReadyDocs && (best > 0.35 || explicitFileAsk || lockedDocId != null)
+            
+            val reason = when {
+                !hasReadyDocs -> "no_docs"
+                explicitFileAsk -> "user_asked"
+                lockedDocId != null -> "doc_locked"
+                best > 0.35 -> "high_score"
+                else -> "low_score"
+            }
             
             Log.i(TAG, "route: useDocs=$useDocs reason=$reason hits=${hits.size} best=$best")
 
-            // ✅ Keep doc mode active while documents are present
+            // ✅ Keep doc mode active ONLY if we're actually using it
             lastRouteWasDocs = useDocs
             if (!useDocs) {
-                lockedDocId = null
+                // Don't clear lockedDocId immediately to allow follow-ups, 
+                // but don't inject context this turn
                 lastDocContext = null
             }
 
