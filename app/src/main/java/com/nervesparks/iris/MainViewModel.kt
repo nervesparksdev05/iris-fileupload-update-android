@@ -402,14 +402,27 @@ $docExcerpts
             val explicitFileAsk =
                 userMessage.contains("file", true) ||
                         userMessage.contains("document", true) ||
-                        userMessage.contains("pdf", true)
+                        userMessage.contains("doc", true) ||  // ✅ Added 'doc' abbreviation
+                        userMessage.contains("pdf", true) ||
+                        userMessage.contains("resume", true) ||
+                        userMessage.contains("uploaded", true)
+
+            // ✅ Add detailed logging for debugging
+            Log.i(TAG, "send: docsSnapshot=${docsSnapshot.size} readyDocs=${readyDocs.size} explicitFileAsk=$explicitFileAsk")
+            docsSnapshot.forEach { doc ->
+                Log.d(TAG, "  doc: name=${doc.name} status=${doc.status} docId=${doc.docId}")
+            }
 
             if (explicitFileAsk && readyDocs.isEmpty()) {
                 val indexing = docsSnapshot.any { it.status.equals("INDEXING", ignoreCase = true) }
+                val failed = docsSnapshot.any { it.status.equals("FAILED", ignoreCase = true) }
                 addMessage(
                     "assistant",
-                    if (indexing) "I'm still indexing your document(s). Try again once indexing finishes."
-                    else "I don't have any indexed documents yet. Please upload a document first."
+                    when {
+                        indexing -> "I'm still indexing your document(s). Please wait a moment and try again."
+                        failed -> "Document indexing failed. Please try uploading the document again."
+                        else -> "I don't have any indexed documents yet. Please upload a document first."
+                    }
                 )
                 return@launch
             }
@@ -471,23 +484,43 @@ $docExcerpts
             val docExcerpts: String? = when {
                 useDocs && hits.isNotEmpty() -> {
                     // Has good retrieval hits - use larger context
+                    Log.d(TAG, "Using ${hits.size} retrieval hits for context")
                     ragRepo.buildContextBlock(hits, maxChars = 2400)
                         .also { lastDocContext = it }
                 }
                 useDocs && lockedDocId != null -> {
                     // No hits but we have a locked doc - get more chunks for better coverage
+                    Log.d(TAG, "No hits, using fallback chunks from lockedDocId=$lockedDocId")
                     val fallback = withContext(Dispatchers.IO) {
                         ragRepo.fallbackTopChunksForDoc(lockedDocId!!, maxChunks = 12)
                     }
+                    Log.d(TAG, "Fallback returned ${fallback.size} chunks")
                     ragRepo.buildContextBlock(fallback, maxChars = 2000)
                         .also { lastDocContext = it }
                 }
+                useDocs && readyDocs.isNotEmpty() -> {
+                    // ✅ NEW: Use first ready doc if no locked doc
+                    val firstReadyDoc = readyDocs.first()
+                    Log.d(TAG, "Using first ready doc as fallback: ${firstReadyDoc.name}")
+                    val fallback = withContext(Dispatchers.IO) {
+                        ragRepo.fallbackTopChunksForDoc(firstReadyDoc.docId, maxChunks = 12)
+                    }
+                    Log.d(TAG, "First doc fallback returned ${fallback.size} chunks")
+                    ragRepo.buildContextBlock(fallback, maxChars = 2000)
+                        .also { 
+                            lastDocContext = it
+                            lockedDocId = firstReadyDoc.docId
+                        }
+                }
                 useDocs -> {
                     // In doc mode but no specific context - will trigger "not found" response
+                    Log.w(TAG, "useDocs=true but no context available!")
                     null
                 }
                 else -> null
             }
+            
+            Log.d(TAG, "docExcerpts length=${docExcerpts?.length ?: 0}")
 
             // ✅ Build prompt with strict document-only mode
             var base = windowedMessages(messages, keepLast = 10)
