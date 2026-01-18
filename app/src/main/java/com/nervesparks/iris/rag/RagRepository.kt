@@ -281,7 +281,7 @@ class RagRepository(
         }
         out.sortByDescending { it.score }
         
-        Log.i(TAG, "retrieve: query='${q.take(50)}...' hits=${out.size} bestScore=${"%0.3f".format(bestScoreFound)} threshold=${"%0.3f".format(dynamicThreshold)}")
+        Log.i(TAG, "retrieve: query='${q.take(50)}...' hits=${out.size} bestScore=${"%.3f".format(bestScoreFound)} threshold=${"%.3f".format(dynamicThreshold)}")
         return out
     }
 
