@@ -475,31 +475,28 @@ RULES:
             val second = hits.getOrNull(1)?.score ?: 0.0
 
             // ✅ SMART ROUTING: Only use docs if query matches well OR user explicitly asks
-            // Threshold 0.35 ensures we don't inject random context for "Hi how are you"
-            val useDocs = hasReadyDocs && (best > 0.35 || explicitFileAsk || lockedDocId != null)
+            // DO NOT include lockedDocId in this check - that causes the "always RAG" bug
+            val useDocs = hasReadyDocs && (best > 0.35 || explicitFileAsk)
             
             val reason = when {
                 !hasReadyDocs -> "no_docs"
                 explicitFileAsk -> "user_asked"
-                lockedDocId != null -> "doc_locked"
                 best > 0.35 -> "high_score"
-                else -> "low_score"
+                else -> "low_score_normal_chat"
             }
             
-            Log.i(TAG, "route: useDocs=$useDocs reason=$reason hits=${hits.size} best=$best")
+            Log.i(TAG, "route: useDocs=$useDocs reason=$reason hits=${hits.size} best=$best lockedDocId=$lockedDocId")
 
-            // ✅ Keep doc mode active ONLY if we're actually using it
+            // ✅ Update doc mode tracking
             lastRouteWasDocs = useDocs
-            if (!useDocs) {
-                // Don't clear lockedDocId immediately to allow follow-ups, 
-                // but don't inject context this turn
+            
+            // ✅ CRITICAL: Clear lockedDocId when user is clearly NOT asking about docs
+            // This allows normal chat to work without document context pollution
+            if (!useDocs && !explicitFileAsk && best < 0.25) {
+                lockedDocId = null
                 lastDocContext = null
+                Log.d(TAG, "Cleared lockedDocId - user is in normal chat mode")
             }
-
-            Log.i(
-                TAG,
-                "route: useDocs=$useDocs reason=$reason ready=${readyDocs.size} hits=${hits.size} best=$best second=$second lockedDocId=$lockedDocId"
-            )
 
             // ✅ Build context with fallback options - IMPROVED sizes
             val docExcerpts: String? = when {
